@@ -192,6 +192,14 @@ def train_step(params, opt_state, batch):
     return params, opt_state, loss
 
 
+train_step = jax.jit(train_step)
+# jax.jit (Just-In-Time compilation) transforms train_step into a compiled GPU program.
+# First call: JAX traces the function and compiles it to optimized GPU code (~5-10s).
+# Every subsequent call: runs the compiled program directly — no Python overhead.
+# This is the single biggest GPU utilization improvement available.
+# The compiled program handles forward pass, backward pass, and Adam update in one shot.
+
+
 # ---------------------------------------------------------------------------
 # SECTION 4: TRAINING DATA
 #
@@ -275,9 +283,15 @@ def train(n_steps=1000, seq_len=64, seed=0):
         # Sample BATCH_SIZE random start positions simultaneously.
         # Shape: (BATCH_SIZE,) — one starting index per sequence in the batch.
 
-        batch = jnp.stack([data[s : s + seq_len + 1] for s in starts])
-        # For each start index, slice out a chunk of seq_len+1 tokens.
-        # jnp.stack turns the list of 1D arrays into a 2D array.
+        offsets = jnp.arange(seq_len + 1)
+        # A range [0, 1, 2, ..., seq_len]. Shape: (seq_len+1,)
+        # Adding this to each start position gives us the full index range for that sequence.
+
+        batch = data[starts[:, None] + offsets[None, :]]
+        # starts[:, None] reshapes starts to (BATCH_SIZE, 1)
+        # offsets[None, :] reshapes offsets to (1, seq_len+1)
+        # Broadcasting adds them together: (BATCH_SIZE, 1) + (1, seq_len+1) → (BATCH_SIZE, seq_len+1)
+        # This is a single GPU indexing operation replacing the Python for loop.
         # Shape: (BATCH_SIZE, seq_len+1)
 
         # --- Gradient update ---
@@ -306,6 +320,20 @@ def train(n_steps=1000, seq_len=64, seed=0):
     print(f"Output:\n{output_text}\n")
 
     wandb.log({"generated_text": wandb.Html(f"<pre>{output_text}</pre>")})
+
+    # --- Save final checkpoint as a versioned W&B Artifact ---
+    artifact = wandb.Artifact(name="model-checkpoint", type="model")
+    # Artifacts are versioned file storage in W&B — each run produces a new version.
+    # type="model" is a convention that tells W&B this is a model file.
+
+    artifact.add_file(final_path)
+    # Attach the checkpoint .pkl file to this artifact.
+
+    wandb.log_artifact(artifact)
+    # Upload to W&B. Visible in the Artifacts tab of your run.
+    # You can download it later, mark it as "best", or link it to a dataset version.
+    print(f"Checkpoint uploaded to W&B artifacts.")
+
     wandb.finish()
 
     return params, final_path
