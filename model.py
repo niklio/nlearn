@@ -331,3 +331,143 @@ def ffn_forward(params, x):
     # Each token is back to its original D_MODEL size, but transformed.
 
     return x  # Shape: (seq_len, D_MODEL)
+
+
+# ---------------------------------------------------------------------------
+# SECTION 4: TRANSFORMER BLOCK + FULL MODEL
+#
+# A transformer block combines everything from Sections 2 and 3 into one
+# repeatable unit. The full model stacks N_LAYERS of these blocks, then
+# projects the output to vocabulary logits for next-token prediction.
+#
+# Data flow through one block:
+#
+#   x ──► LayerNorm ──► Attention ──► + ──► LayerNorm ──► FFN ──► + ──►
+#   │                                 ▲                            ▲
+#   └─────────────────────────────────┘                            │
+#   └────────────────────────────────────────────────────────────-─┘
+#
+# The two "+" symbols are residual connections — the original input is
+# always added back to the sublayer's output.
+# ---------------------------------------------------------------------------
+
+def init_block(key):
+    """
+    Initializes all parameters for one transformer block:
+      - attention weights (W_q, W_k, W_v, W_o)
+      - two layer norms (one before attention, one before FFN)
+      - feed-forward weights (W1, b1, W2, b2)
+    """
+    key_attn, key_ffn = random.split(key)  # One key for attention, one for FFN.
+
+    return {
+        'ln1':  init_layer_norm(),       # Layer norm applied before attention.
+        'attn': init_attention(key_attn),# Multi-head attention weights.
+        'ln2':  init_layer_norm(),       # Layer norm applied before FFN.
+        'ffn':  init_ffn(key_ffn),       # Feed-forward network weights.
+    }
+
+
+def block_forward(params, x, mask):
+    """
+    Runs one full transformer block on input x.
+
+    x:    shape (seq_len, D_MODEL)
+    mask: causal mask shape (seq_len, seq_len)
+    Returns same shape as x.
+    """
+
+    # --- Sublayer 1: Multi-head self-attention ---
+
+    x = x + attention_forward(params['attn'], layer_norm(params['ln1'], x), mask)
+    # Breaking this down right to left:
+    #   1. layer_norm(params['ln1'], x)          — normalize x before attention
+    #   2. attention_forward(..., normalized_x)  — run attention on the normalized input
+    #   3. x + (result)                          — residual connection: add original x back
+    #
+    # The residual connection is critical. Without it, in a 4-layer model gradients
+    # would have to flow back through 4 chained multiplications and would shrink to
+    # near-zero (vanishing gradients). The shortcut gives gradients a direct path back.
+
+    # --- Sublayer 2: Feed-forward network ---
+
+    x = x + ffn_forward(params['ffn'], layer_norm(params['ln2'], x))
+    # Same pattern:
+    #   1. layer_norm(params['ln2'], x)  — normalize (x now includes the attention update)
+    #   2. ffn_forward(..., normalized)  — run FFN on normalized input
+    #   3. x + (result)                 — residual connection again
+
+    return x  # Shape: (seq_len, D_MODEL)
+
+
+# ---------------------------------------------------------------------------
+# FULL MODEL
+# ---------------------------------------------------------------------------
+
+def init_model(key):
+    """
+    Initializes every parameter in the full decoder-only transformer.
+    Returns a single nested dict containing all parameters.
+    """
+    # Split into enough keys: 1 for embeddings, N_LAYERS for blocks, 1 for lm_head.
+    keys = random.split(key, N_LAYERS + 2)
+
+    return {
+        'embeddings': init_embeddings(keys[0]),
+        # Token + positional embedding tables. Shape: (VOCAB_SIZE, D_MODEL) and (MAX_SEQ_LEN, D_MODEL).
+
+        'blocks': [init_block(keys[i + 1]) for i in range(N_LAYERS)],
+        # A Python list of N_LAYERS block parameter dicts.
+        # Each block is independent with its own weights — they don't share parameters.
+        # List comprehension: for i in 0,1,2,3 → init_block(keys[1]), init_block(keys[2]), ...
+
+        'ln_final': init_layer_norm(),
+        # One last layer norm applied after all blocks, before the output projection.
+        # GPT-2 introduced this — it stabilizes the final representations.
+
+        'lm_head': random.normal(keys[-1], (D_MODEL, VOCAB_SIZE)) * 0.02,
+        # "Language model head" — projects each token's D_MODEL vector to VOCAB_SIZE logits.
+        # Shape: (128, 256). One logit per vocabulary token.
+        # The logit with the highest value = the model's best guess for the next token.
+    }
+
+
+def model_forward(params, token_ids):
+    """
+    Full forward pass: token IDs in, next-token logits out.
+
+    token_ids: 1D integer array of shape (seq_len,)
+    Returns:   2D float array of shape (seq_len, VOCAB_SIZE)
+               logits[i] = scores for what token comes after position i
+    """
+
+    # --- Step 1: Embed tokens ---
+    x = embed(params['embeddings'], token_ids)
+    # Convert integer token IDs to vectors and add positional information.
+    # Shape: (seq_len, D_MODEL)
+
+    # --- Step 2: Build causal mask ---
+    seq_len = token_ids.shape[0]
+    mask = make_causal_mask(seq_len)
+    # Shape: (seq_len, seq_len). Built once and reused by every block.
+
+    # --- Step 3: Pass through all transformer blocks ---
+    for block_params in params['blocks']:
+        x = block_forward(block_params, x, mask)
+    # Each block refines the representation of every token.
+    # After N_LAYERS blocks, each token vector contains a rich contextual
+    # summary informed by everything that came before it.
+
+    # --- Step 4: Final layer norm ---
+    x = layer_norm(params['ln_final'], x)
+    # Normalize one last time before projecting to vocabulary.
+    # Shape unchanged: (seq_len, D_MODEL)
+
+    # --- Step 5: Project to vocabulary logits ---
+    logits = x @ params['lm_head']
+    # (seq_len, D_MODEL) @ (D_MODEL, VOCAB_SIZE) → (seq_len, VOCAB_SIZE)
+    # For each position in the sequence, we now have one score per vocabulary token.
+    # These are raw unnormalized scores (logits) — not probabilities yet.
+    # To get probabilities: jax.nn.softmax(logits, axis=-1)
+
+    return logits
