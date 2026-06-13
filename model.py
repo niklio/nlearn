@@ -7,13 +7,14 @@ from jax import random               # JAX's random number module (different fro
 # These are the knobs that define the size and shape of the model.
 # ---------------------------------------------------------------------------
 
-VOCAB_SIZE  = 4000     # Number of unique tokens. Matches our trained BPE tokenizer (was 256 for ASCII bytes).
-D_MODEL     = 128      # "Dimension of the model" — every token is represented as a vector of this length.
-                       # Bigger = more expressive, but slower. GPT-3 uses 12288.
-N_HEADS     = 4        # Number of attention heads. D_MODEL must be divisible by N_HEADS (128 / 4 = 32 per head).
-D_FF        = 512      # Hidden size of the feed-forward sublayer inside each block. Typically 4 * D_MODEL.
-N_LAYERS    = 4        # How many transformer blocks to stack. More layers = deeper reasoning. GPT-3 has 96.
-MAX_SEQ_LEN = 128      # Maximum number of tokens the model can process at once (its "context window").
+VOCAB_SIZE  = 4000     # Number of unique tokens. Matches our trained BPE tokenizer.
+D_MODEL     = 512      # "Dimension of the model" — every token is represented as a vector of this length.
+                       # Increased from 128 → 512. Parameters scale as D_MODEL², so this is ~16M params vs 873k.
+N_HEADS     = 8        # Number of attention heads. D_MODEL must be divisible by N_HEADS (512 / 8 = 64 per head).
+                       # Increased from 4 → 8 to match the larger D_MODEL.
+D_FF        = 2048     # Hidden size of the feed-forward sublayer. Kept at 4 * D_MODEL (4 * 512 = 2048).
+N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
+MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
 
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS

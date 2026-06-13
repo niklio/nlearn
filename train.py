@@ -107,26 +107,47 @@ def cross_entropy_loss(params, token_ids):
 
 
 # ---------------------------------------------------------------------------
-# SECTION 2: OPTIMIZER (ADAM)
+# SECTION 2: OPTIMIZER (ADAM + LEARNING RATE SCHEDULE)
 #
-# Adam (Adaptive Moment Estimation) is the standard optimizer for transformers.
-# It's an improvement over plain gradient descent — instead of:
-#   param = param - learning_rate * gradient
+# We now use a learning rate *schedule* instead of a fixed rate:
 #
-# Adam tracks a running average of past gradients (momentum) and a running
-# average of squared gradients (adaptive scaling), giving each parameter
-# its own effective learning rate that adapts during training.
+#   Warmup phase (steps 0 → WARMUP_STEPS):
+#     LR ramps linearly from 0 → PEAK_LR.
+#     Starting at 0 prevents large early updates from destabilizing the
+#     randomly initialized weights before the optimizer has built up momentum.
 #
-# learning_rate controls the step size. Too high = unstable. Too low = slow.
-# 1e-3 is a common default for Adam.
+#   Cosine decay phase (steps WARMUP_STEPS → N_STEPS):
+#     LR follows a cosine curve from PEAK_LR → END_LR.
+#     Gradually slowing down lets the model make fine-grained adjustments
+#     as it approaches convergence, instead of overshooting the minimum.
+#
+#   LR curve shape:
+#       ^
+#  peak |     *
+#       |   *   *
+#       |  *      *  *  *
+#   end | *               * * * * *
+#       +-------------------------> steps
+#         warmup   cosine decay
 # ---------------------------------------------------------------------------
 
-LEARNING_RATE = 1e-3   # How big each parameter update step is.
+N_STEPS      = 5000    # Total training steps — more than before to take advantage of the bigger model.
+WARMUP_STEPS = 200     # Ramp up LR over the first 200 steps (~4% of training).
+PEAK_LR      = 1e-3    # Peak learning rate — same as our previous fixed LR.
+END_LR       = 1e-4    # End learning rate — decay to 10% of peak by the final step.
 
-optimizer = optax.adam(LEARNING_RATE)
-# optax.adam returns an optimizer object with two methods:
-#   .init(params)              → creates initial optimizer state (momentum buffers etc.)
-#   .update(grads, opt_state)  → computes parameter updates from gradients + state
+schedule = optax.warmup_cosine_decay_schedule(
+    init_value=0.0,           # LR starts at 0.
+    peak_value=PEAK_LR,       # Ramps up to this value over warmup_steps.
+    warmup_steps=WARMUP_STEPS,
+    decay_steps=N_STEPS,      # Total steps over which cosine decay runs.
+    end_value=END_LR,         # Final LR at the end of training.
+)
+# schedule is a function: schedule(step) → learning_rate
+# optax.adam will call it automatically each step using the step count in opt_state.
+
+optimizer = optax.adam(learning_rate=schedule)
+# Same Adam optimizer, but now with an adaptive LR that changes each step.
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +229,12 @@ train_step = jax.jit(train_step)
 # genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 256
-# How many independent sequences to process per training step.
-# Benchmarked on M3: batch_size=256 gives 34k tokens/sec vs 5k at batch_size=16
+BATCH_SIZE = 32
+# Reduced from 256 → 32 because D_MODEL=512 and seq_len=512 use much more memory.
+# Attention matrices scale as batch * heads * seq_len², so going from
+# seq_len=64 to seq_len=512 is 64x more attention memory per batch element.
 
-CHECKPOINT_EVERY = 250
+CHECKPOINT_EVERY = 500
 # Save a checkpoint every this many steps.
 
 with open('shakespeare.txt', 'r') as f:
@@ -236,7 +258,7 @@ def decode(token_ids):
 # SECTION 5: TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def train(n_steps=1000, seq_len=64, seed=0):
+def train(n_steps=N_STEPS, seq_len=512, seed=0):
     """
     Trains the model for n_steps gradient updates and logs to Weights & Biases.
 
@@ -259,6 +281,9 @@ def train(n_steps=1000, seq_len=64, seed=0):
             "vocab_size":    VOCAB_SIZE,
             "dataset":       "tinyshakespeare",
             "tokenizer":     "bpe-4000",
+            "warmup_steps":  WARMUP_STEPS,
+            "peak_lr":       PEAK_LR,
+            "end_lr":        END_LR,
         }
     )
 
