@@ -216,3 +216,118 @@ def attention_forward(params, x, mask):
     # combinations of head outputs are useful.
 
     return out  # Shape: (seq_len, D_MODEL) — same shape as the input x.
+
+
+# ---------------------------------------------------------------------------
+# SECTION 3: LAYER NORM + FEED-FORWARD NETWORK
+#
+# Each transformer block has two sublayers:
+#   1. Multi-head attention (Section 2)
+#   2. Feed-forward network (this section)
+#
+# Both sublayers are wrapped with:
+#   - Layer normalization (applied BEFORE the sublayer — "pre-norm" style)
+#   - A residual connection (input is added back AFTER the sublayer)
+#
+# Layer norm keeps activations stable during training.
+# Residual connections let gradients flow back through many layers without vanishing.
+# ---------------------------------------------------------------------------
+
+def init_layer_norm():
+    """
+    Layer norm has two learnable parameters per feature dimension:
+      gamma (scale) — initialized to 1, learned multiplier
+      beta  (shift) — initialized to 0, learned offset
+    No randomness needed here — these are deterministic starting points.
+    """
+    return {
+        'gamma': jnp.ones(D_MODEL),   # Shape: (D_MODEL,). Ones = no scaling at init.
+        'beta':  jnp.zeros(D_MODEL),  # Shape: (D_MODEL,). Zeros = no shift at init.
+    }
+
+
+def layer_norm(params, x):
+    """
+    Normalizes each token's vector to have mean=0 and std=1,
+    then applies a learned scale (gamma) and shift (beta).
+
+    x: shape (seq_len, D_MODEL)
+    Returns same shape.
+    """
+    eps = 1e-5
+    # A tiny constant added to the denominator to prevent division by zero
+    # in the rare case where variance is exactly 0.
+
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    # Compute the mean across the D_MODEL dimension for each token independently.
+    # axis=-1 = last axis = the feature dimension.
+    # keepdims=True keeps the shape as (seq_len, 1) instead of (seq_len,)
+    # so that broadcasting works correctly in the subtraction below.
+
+    var = jnp.var(x, axis=-1, keepdims=True)
+    # Compute the variance across D_MODEL for each token.
+    # Shape: (seq_len, 1)
+
+    x_norm = (x - mean) / jnp.sqrt(var + eps)
+    # Subtract mean and divide by standard deviation.
+    # Now each token vector has mean=0 and std=1 across its D_MODEL features.
+    # Shape: (seq_len, D_MODEL)
+
+    return params['gamma'] * x_norm + params['beta']
+    # Apply learned scale and shift.
+    # gamma and beta are shape (D_MODEL,) — they broadcast across the seq_len dimension.
+    # At init this is a no-op (1 * x_norm + 0), but during training
+    # the model learns the right scale and shift for each feature.
+
+
+def init_ffn(key):
+    """
+    The feed-forward network is two linear layers with a GeLU activation in between.
+    It operates on each token independently (no communication between tokens here).
+
+    Architecture: D_MODEL → D_FF → D_MODEL
+                    128   →  512  →   128
+    The expansion to D_FF (4× wider) gives the model capacity to compute
+    complex non-linear transformations on each token's representation.
+    """
+    key1, key2 = random.split(key)  # Two keys for two weight matrices.
+
+    return {
+        'W1': random.normal(key1, (D_MODEL, D_FF)) * 0.02,
+        # First linear layer expands from D_MODEL to D_FF.
+        # Shape: (128, 512)
+
+        'b1': jnp.zeros(D_FF),
+        # Bias for the first layer. Shape: (512,). Initialized to zero.
+
+        'W2': random.normal(key2, (D_FF, D_MODEL)) * 0.02,
+        # Second linear layer compresses back from D_FF to D_MODEL.
+        # Shape: (512, 128)
+
+        'b2': jnp.zeros(D_MODEL),
+        # Bias for the second layer. Shape: (128,). Initialized to zero.
+    }
+
+
+def ffn_forward(params, x):
+    """
+    Runs the feed-forward network on each token independently.
+
+    x: shape (seq_len, D_MODEL)
+    Returns same shape.
+    """
+    x = x @ params['W1'] + params['b1']
+    # Linear projection: (seq_len, 128) @ (128, 512) + (512,) → (seq_len, 512)
+    # Each token is now represented in a 512-dimensional space.
+
+    x = jax.nn.gelu(x)
+    # GeLU (Gaussian Error Linear Unit) activation function.
+    # Similar to ReLU (zeros out negatives) but smooth — it doesn't have a hard cutoff at 0.
+    # Used by GPT-2, GPT-3, and most modern LLMs.
+    # Without a non-linearity here, two linear layers would collapse into one — no extra power.
+
+    x = x @ params['W2'] + params['b2']
+    # Project back down: (seq_len, 512) @ (512, 128) + (128,) → (seq_len, D_MODEL)
+    # Each token is back to its original D_MODEL size, but transformed.
+
+    return x  # Shape: (seq_len, D_MODEL)
