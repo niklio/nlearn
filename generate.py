@@ -21,10 +21,10 @@ import tempfile
 
 import jax
 import jax.numpy as jnp
+import tiktoken
 import wandb
 
 from model import generate as model_generate
-from tokenizer import load_tokenizer, encode as bpe_encode, decode as bpe_decode
 
 
 def download_checkpoint(run_id, project, entity):
@@ -92,28 +92,18 @@ def load_params(checkpoint_path):
     # JAX will move them to the GPU automatically when used in computations.
 
 
-def run_generation(params, prompt, n_tokens, temperature, tokenizer_path):
+def run_generation(params, prompt, n_tokens, temperature):
     """
     Encode the prompt, run generation, decode and return the output text.
     """
-    vocab, merges, char_to_id = load_tokenizer(tokenizer_path)
-
-    def encode(text):
-        return jnp.array(bpe_encode(text, char_to_id, merges))
-
-    def decode(ids):
-        return bpe_decode([int(t) for t in ids], vocab)
-
-    prompt_ids = encode(prompt)
+    enc = tiktoken.get_encoding("gpt2")
+    prompt_ids = jnp.array(enc.encode(prompt))
     print(f"Prompt: \"{prompt}\" ({len(prompt_ids)} tokens)")
     print(f"Generating {n_tokens} tokens at temperature {temperature}...\n")
 
     key = jax.random.PRNGKey(0)
     output_ids = model_generate(params, prompt_ids, n_tokens=n_tokens, key=key, temperature=temperature)
-    # model_generate is the generate() function from model.py.
-    # Returns the full sequence including the prompt.
-
-    return decode(output_ids)
+    return enc.decode([int(t) for t in output_ids])
 
 
 def main():
@@ -134,8 +124,6 @@ def main():
                         help="W&B project name (default: nlearn-transformer).")
     parser.add_argument("--entity",     default=None,
                         help="W&B entity/username. Defaults to your logged-in W&B user.")
-    parser.add_argument("--tokenizer",  default="tokenizer.json",
-                        help="Path to tokenizer.json (default: tokenizer.json).")
 
     args = parser.parse_args()
 
@@ -160,7 +148,7 @@ def main():
 
     # Load params and generate.
     params = load_params(checkpoint_path)
-    output = run_generation(params, args.prompt, args.n_tokens, args.temperature, args.tokenizer)
+    output = run_generation(params, args.prompt, args.n_tokens, args.temperature)
 
     print("=" * 60)
     print(output)

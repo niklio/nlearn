@@ -1,15 +1,20 @@
 import sys
 import signal
-import jax                          # Core JAX: autodiff, JIT
-import jax.numpy as jnp              # JAX NumPy for array operations
-from jax import random               # Explicit random key management
-import optax                         # JAX optimizer library (Adam, SGD, etc.)
-import wandb                         # Weights & Biases experiment tracking
-import pickle                        # Python's built-in serialization — used for checkpoints
-import os                            # File path utilities
+import threading
+import queue as queue_mod
+from itertools import cycle
+import jax
+import jax.numpy as jnp
+from jax import random
+import optax
+import wandb
+import pickle
+import os
+import numpy as np
+import tiktoken
+from datasets import load_dataset
 
 from model import init_model, model_forward, generate, VOCAB_SIZE
-from tokenizer import load_tokenizer, encode as bpe_encode, decode as bpe_decode
 
 # ---------------------------------------------------------------------------
 # CHECKPOINTING
@@ -206,64 +211,98 @@ def make_train_step(optimizer):
 BATCH_SIZE = 32
 CHECKPOINT_EVERY = 500
 
-import numpy as np
-
 # ---------------------------------------------------------------------------
-# DATA LOADING
-#
-# Supports two modes, selected by whether datasets/fineweb.bin exists:
-#
-#   Binary mode (FineWeb-Edu):
-#     numpy.memmap reads the pre-tokenized binary file directly from disk.
-#     The OS pages in only the chunks actually accessed — the full file
-#     never loads into RAM. This scales to arbitrarily large datasets.
-#
-#   Text mode (Shakespeare fallback):
-#     Loads shakespeare.txt, encodes with BPE tokenizer. Used for quick
-#     local experiments when fineweb.bin hasn't been prepared yet.
+# DATASET REGISTRY
 # ---------------------------------------------------------------------------
 
-FINEWEB_BIN = "datasets/fineweb-edu.bin"
+DATASETS = {
+    "fineweb-edu": {
+        "hf_dataset": "HuggingFaceFW/fineweb-edu",
+        "hf_config":  "sample-10BT",
+        "text_field": "text",
+    },
+    "c4": {
+        "hf_dataset": "allenai/c4",
+        "hf_config":  "en",
+        "text_field": "text",
+    },
+    "openwebtext": {
+        "hf_dataset": "Skylion007/openwebtext",
+        "hf_config":  None,
+        "text_field": "text",
+    },
+}
 
-print("Loading BPE tokenizer...")
-_vocab, _merges, _char_to_id = load_tokenizer('tokenizer.json')
+# ---------------------------------------------------------------------------
+# STREAMING DATA LOADER
+#
+# Streams documents from HuggingFace, tokenizes with tiktoken (Rust, ~100x
+# faster than pure-Python BPE), and fills a rolling token buffer in a
+# background thread so the GPU never waits for data.
+#
+# Buffer design:
+#   - Background thread: streams docs → tokenizes → puts 500k-token chunks
+#     into a queue (up to PREFETCH chunks buffered ahead).
+#   - Main thread: randomly samples batches from the buffer.
+#     When the buffer drops below half, it tops up from the queue.
+# ---------------------------------------------------------------------------
 
-def encode(text):
-    """Encode text to BPE token IDs as a JAX array."""
-    return jnp.array(bpe_encode(text, _char_to_id, _merges))
+CHUNK_SIZE = 500_000   # tokens per background chunk
+PREFETCH   = 4         # chunks to buffer ahead of training
 
-def decode(token_ids):
-    """Decode BPE token IDs back to text."""
-    return bpe_decode([int(t) for t in token_ids], _vocab)
+class StreamingLoader:
+    def __init__(self, dataset_cfg, seq_len, batch_size):
+        self.enc        = tiktoken.get_encoding("gpt2")
+        self.seq_len    = seq_len
+        self.batch_size = batch_size
+        self._q         = queue_mod.Queue(maxsize=PREFETCH)
+        self._buf       = np.array([], dtype=np.int32)
 
-def load_data():
-    """
-    Load training data. Uses fineweb.bin if available, otherwise Shakespeare.
-    Returns a 1D integer array of token IDs.
-    """
-    if os.path.exists(FINEWEB_BIN):
-        data = np.memmap(FINEWEB_BIN, dtype=np.uint16, mode='r')
-        # np.memmap maps the file into virtual memory — reads happen on demand
-        # from disk without loading everything into RAM.
-        # dtype=uint16 matches what data.py wrote (2 bytes per token).
-        data = jnp.array(data, dtype=jnp.int32)
-        # Convert to int32 for JAX indexing compatibility.
-        print(f"Loaded FineWeb-Edu: {len(data):,} tokens from {FINEWEB_BIN}")
-        return data
-    else:
-        print(f"{FINEWEB_BIN} not found — falling back to Shakespeare. Run: python3 data.py --dataset fineweb-edu --target-tokens 500_000_000")
-        with open('datasets/shakespeare.txt', 'r') as f:
-            text = f.read()
-        data = encode(text)
-        print(f"Loaded Shakespeare: {len(data):,} tokens")
-        return data
+        t = threading.Thread(target=self._producer, args=(dataset_cfg,), daemon=True)
+        t.start()
+
+        print("Prefilling token buffer...")
+        self._refill()
+        print(f"Buffer ready: {len(self._buf):,} tokens")
+
+    def _producer(self, cfg):
+        """Background thread: stream → tokenize → enqueue chunks."""
+        ds = load_dataset(
+            cfg["hf_dataset"],
+            name=cfg["hf_config"],
+            split="train",
+            streaming=True,
+        )
+        chunk = []
+        for ex in cycle(ds):
+            chunk.extend(self.enc.encode(ex[cfg["text_field"]]))
+            chunk.append(self.enc.eot_token)  # document boundary
+            while len(chunk) >= CHUNK_SIZE:
+                self._q.put(np.array(chunk[:CHUNK_SIZE], dtype=np.int32))
+                chunk = chunk[CHUNK_SIZE:]
+
+    def _refill(self):
+        """Block until buffer holds at least CHUNK_SIZE * 2 tokens."""
+        while len(self._buf) < CHUNK_SIZE * 2:
+            self._buf = np.concatenate([self._buf, self._q.get()])
+
+    def get_batch(self):
+        """Return a random batch of shape (batch_size, seq_len+1)."""
+        min_tokens = self.batch_size * (self.seq_len + 1) * 4
+        if len(self._buf) < min_tokens:
+            self._refill()
+        n      = len(self._buf)
+        starts = np.random.randint(0, n - self.seq_len - 1, size=(self.batch_size,))
+        idx    = starts[:, None] + np.arange(self.seq_len + 1)[None, :]
+        return jnp.array(self._buf[idx], dtype=jnp.int32)
 
 
 # ---------------------------------------------------------------------------
 # SECTION 5: TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR, run_name=None):
+def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR,
+          run_name=None, dataset="fineweb-edu"):
     warmup = min(WARMUP_STEPS, n_steps // 5)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -275,6 +314,8 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     optimizer = optax.adam(learning_rate=schedule)
     train_step = make_train_step(optimizer)
 
+    dataset_cfg = DATASETS[dataset]
+
     wandb.init(
         project="nlearn-transformer",
         name=run_name,
@@ -284,14 +325,14 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
             "batch_size":   batch_size,
             "peak_lr":      peak_lr,
             "end_lr":       peak_lr / 10,
-            "d_model":      128,
-            "n_heads":      4,
+            "d_model":      512,
+            "n_heads":      8,
             "n_layers":     4,
-            "d_ff":         512,
+            "d_ff":         2048,
             "vocab_size":   VOCAB_SIZE,
-            "dataset":      "fineweb-edu" if os.path.exists(FINEWEB_BIN) else "tinyshakespeare",
-            "tokenizer":    "bpe-4000",
-            "warmup_steps": WARMUP_STEPS,
+            "dataset":      dataset,
+            "tokenizer":    "tiktoken-gpt2",
+            "warmup_steps": warmup,
         }
     )
 
@@ -310,18 +351,13 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    data = load_data()
-    n_tokens = len(data)
-    print(f"Training on {n_tokens} tokens, batch_size={batch_size}, seq_len={seq_len}")
+    loader = StreamingLoader(dataset_cfg, seq_len, batch_size)
+    print(f"Training on {dataset}, batch_size={batch_size}, seq_len={seq_len}")
     print(f"Running for {n_steps} steps...\n")
 
     loss = None
     for step in range(n_steps):
-        key, subkey = random.split(key)
-        starts = random.randint(subkey, (batch_size,), 0, n_tokens - seq_len - 1)
-        offsets = jnp.arange(seq_len + 1)
-        batch = data[starts[:, None] + offsets[None, :]]
-
+        batch = loader.get_batch()
         params, opt_state, loss = train_step(params, opt_state, batch)
 
         wandb.log({"loss": float(loss), "step": step})
@@ -342,31 +378,24 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     final_path = save_checkpoint(params, n_steps)
     print(f"\nTraining complete. Final loss: {loss:.4f}\n")
 
-    # --- Generate text from a Shakespeare-style prompt ---
-    print("Generating text from prompt 'ROMEO:'...")
+    # --- Generate a sample ---
+    enc = tiktoken.get_encoding("gpt2")
+    prompt = "The history of artificial intelligence"
+    print(f"Generating text from prompt '{prompt}'...")
     key, gen_key = random.split(key)
-    prompt_ids = encode("ROMEO:")
+    prompt_ids = jnp.array(enc.encode(prompt))
     output_ids = generate(params, prompt_ids, n_tokens=200, key=gen_key, temperature=0.8)
-    output_text = decode(output_ids)
+    output_text = enc.decode([int(t) for t in output_ids])
     print(f"Output:\n{output_text}\n")
 
     wandb.log({"generated_text": wandb.Html(f"<pre>{output_text}</pre>")})
 
-    # --- Save final checkpoint as a versioned W&B Artifact ---
     artifact = wandb.Artifact(name="model-checkpoint", type="model")
-    # Artifacts are versioned file storage in W&B — each run produces a new version.
-    # type="model" is a convention that tells W&B this is a model file.
-
     artifact.add_file(final_path)
-    # Attach the checkpoint .pkl file to this artifact.
-
     wandb.log_artifact(artifact)
-    # Upload to W&B. Visible in the Artifacts tab of your run.
-    # You can download it later, mark it as "best", or link it to a dataset version.
-    print(f"Checkpoint uploaded to W&B artifacts.")
+    print("Checkpoint uploaded to W&B artifacts.")
 
     wandb.finish()
-
     return params, final_path
 
 
@@ -379,5 +408,7 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
     p.add_argument("--peak_lr",    type=float, default=PEAK_LR)
     p.add_argument("--run_name",   type=str,   default=None)
+    p.add_argument("--dataset",    type=str,   default="fineweb-edu",
+                   choices=list(DATASETS.keys()))
     args = p.parse_args()
     train(**vars(args))

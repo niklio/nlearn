@@ -7,7 +7,7 @@ from jax import random               # JAX's random number module (different fro
 # These are the knobs that define the size and shape of the model.
 # ---------------------------------------------------------------------------
 
-VOCAB_SIZE  = 4000     # Number of unique tokens. Matches our trained BPE tokenizer.
+VOCAB_SIZE  = 50257    # GPT-2 vocabulary size (tiktoken "gpt2" encoding).
 D_MODEL     = 512      # "Dimension of the model" — every token is represented as a vector of this length.
                        # Increased from 128 → 512. Parameters scale as D_MODEL², so this is ~16M params vs 873k.
 N_HEADS     = 8        # Number of attention heads. D_MODEL must be divisible by N_HEADS (512 / 8 = 64 per head).

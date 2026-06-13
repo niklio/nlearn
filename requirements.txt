@@ -2,4 +2,5 @@ jax[cpu]
 optax
 wandb
 datasets
+tiktoken
 numpy
