@@ -7,7 +7,7 @@ from jax import random               # JAX's random number module (different fro
 # These are the knobs that define the size and shape of the model.
 # ---------------------------------------------------------------------------
 
-VOCAB_SIZE  = 256      # Number of unique tokens the model knows about. 256 = one per ASCII byte, simple for learning.
+VOCAB_SIZE  = 4000     # Number of unique tokens. Matches our trained BPE tokenizer (was 256 for ASCII bytes).
 D_MODEL     = 128      # "Dimension of the model" — every token is represented as a vector of this length.
                        # Bigger = more expressive, but slower. GPT-3 uses 12288.
 N_HEADS     = 4        # Number of attention heads. D_MODEL must be divisible by N_HEADS (128 / 4 = 32 per head).

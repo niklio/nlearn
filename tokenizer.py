@@ -190,6 +190,30 @@ def decode(ids, vocab):
 # SCRIPT: train on Shakespeare and print some stats
 # ---------------------------------------------------------------------------
 
+def load_tokenizer(path):
+    """
+    Load a previously trained tokenizer from a JSON file.
+
+    path: path to the JSON file saved by train()
+    Returns: (vocab, merges, char_to_id) — same as train() returns
+    """
+    import json
+
+    with open(path, 'r') as f:
+        data = json.load(f)
+
+    vocab = {int(k): v for k, v in data['vocab'].items()}
+    # JSON requires string keys, so we stored int IDs as strings. Convert back.
+
+    merges = [((a, b), c) for (a, b), c in data['merges']]
+    # Restore the list of ((id_a, id_b), new_id) tuples.
+
+    char_to_id = data['char_to_id']
+    # Already the right format: {str: int}
+
+    return vocab, merges, char_to_id
+
+
 if __name__ == "__main__":
     import json
 

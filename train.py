@@ -3,8 +3,51 @@ import jax.numpy as jnp              # JAX NumPy for array operations
 from jax import random               # Explicit random key management
 import optax                         # JAX optimizer library (Adam, SGD, etc.)
 import wandb                         # Weights & Biases experiment tracking
+import pickle                        # Python's built-in serialization — used for checkpoints
+import os                            # File path utilities
 
 from model import init_model, model_forward, generate, VOCAB_SIZE
+from tokenizer import load_tokenizer, encode as bpe_encode, decode as bpe_decode
+
+# ---------------------------------------------------------------------------
+# CHECKPOINTING
+#
+# Saving model weights to disk so we can:
+#   1. Resume training if it crashes
+#   2. Load trained weights later for generation
+#   3. Compare checkpoints from different points in training
+#
+# We use pickle — Python's built-in serialization. It handles nested dicts
+# and JAX arrays cleanly. For very large models (>10GB) you'd use orbax
+# (JAX's official checkpointing library), but pickle is fine at our scale.
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_DIR = "checkpoints"
+
+def save_checkpoint(params, step):
+    """Save model parameters to disk at a given training step."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    # Create the checkpoints/ directory if it doesn't exist yet.
+
+    path = os.path.join(CHECKPOINT_DIR, f"step_{step:06d}.pkl")
+    # Zero-pad the step number so filenames sort correctly (step_000500.pkl, etc.)
+
+    with open(path, 'wb') as f:
+        pickle.dump(jax.device_get(params), f)
+    # jax.device_get() moves all JAX arrays from GPU memory to CPU numpy arrays.
+    # This is necessary before pickling — you can't serialize GPU memory directly.
+
+    print(f"  Checkpoint saved: {path}")
+    return path
+
+
+def load_checkpoint(path):
+    """Load model parameters from a checkpoint file."""
+    with open(path, 'rb') as f:
+        params = pickle.load(f)
+    # pickle.load restores the nested dict of numpy arrays.
+    # JAX will automatically move them back to the GPU when used in computations.
+    return params
 
 # ---------------------------------------------------------------------------
 # SECTION 1: LOSS FUNCTION
@@ -160,22 +203,25 @@ def train_step(params, opt_state, batch):
 BATCH_SIZE = 256
 # How many independent sequences to process per training step.
 # Benchmarked on M3: batch_size=256 gives 34k tokens/sec vs 5k at batch_size=16
-# — the GPU is underutilized at smaller sizes so we get nearly free throughput.
+
+CHECKPOINT_EVERY = 250
+# Save a checkpoint every this many steps.
 
 with open('shakespeare.txt', 'r') as f:
     TRAINING_TEXT = f.read()
-# Read the entire file as a string. ~1.1M characters.
+
+# Load the BPE tokenizer trained on Shakespeare.
+# This gives us encode/decode that use 4000 subword tokens instead of 256 ASCII bytes.
+print("Loading BPE tokenizer...")
+_vocab, _merges, _char_to_id = load_tokenizer('tokenizer.json')
 
 def encode(text):
-    """Converts a string to a JAX array of ASCII byte values (our token IDs)."""
-    return jnp.array([ord(c) for c in text])
+    """Encode text to BPE token IDs as a JAX array."""
+    return jnp.array(bpe_encode(text, _char_to_id, _merges))
 
 def decode(token_ids):
-    """Converts an array of token IDs back to a string."""
-    return ''.join(
-        chr(int(t)) if 32 <= int(t) < 127 else '?'  # Only print printable ASCII.
-        for t in token_ids
-    )
+    """Decode BPE token IDs back to text."""
+    return bpe_decode([int(t) for t in token_ids], _vocab)
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +250,7 @@ def train(n_steps=1000, seq_len=64, seed=0):
             "d_ff":          512,
             "vocab_size":    VOCAB_SIZE,
             "dataset":       "tinyshakespeare",
+            "tokenizer":     "bpe-4000",
         }
     )
 
@@ -241,8 +288,14 @@ def train(n_steps=1000, seq_len=64, seed=0):
         if step % 100 == 0:
             print(f"Step {step:>4}  loss: {loss:.4f}")
 
-    print("\nTraining complete.")
-    print(f"Final loss: {loss:.4f}\n")
+        if step > 0 and step % CHECKPOINT_EVERY == 0:
+            save_checkpoint(params, step)
+            # Periodic checkpoint — lets us resume training or compare
+            # weights at different points in training.
+
+    # --- Save final checkpoint ---
+    final_path = save_checkpoint(params, n_steps)
+    print(f"\nTraining complete. Final loss: {loss:.4f}\n")
 
     # --- Generate text from a Shakespeare-style prompt ---
     print("Generating text from prompt 'ROMEO:'...")
@@ -255,7 +308,7 @@ def train(n_steps=1000, seq_len=64, seed=0):
     wandb.log({"generated_text": wandb.Html(f"<pre>{output_text}</pre>")})
     wandb.finish()
 
-    return params
+    return params, final_path
 
 
 if __name__ == "__main__":
