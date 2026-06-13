@@ -61,8 +61,8 @@ def download_checkpoint(run_id, project, entity):
         raise ValueError(
             f"No model artifact found for run {run_id}.\n"
             f"Make sure the run completed successfully and uploaded a checkpoint.\n"
-            f"Runs before the artifact logging was added (avid-cloud-3 and earlier) "
-            f"don't have artifacts — use a local checkpoint file instead with --local-checkpoint."
+            f"Note: use the run ID (e.g. 'xm5xjq8g'), not the run name (e.g. 'crimson-wood-4').\n"
+            f"The run ID is the short alphanumeric string in the W&B run URL."
         )
 
     print(f"Found artifact: {model_artifact.name} (version {model_artifact.version})")
@@ -120,7 +120,8 @@ def main():
     parser = argparse.ArgumentParser(description="Generate text from a W&B model checkpoint.")
 
     parser.add_argument("--run-id",     required=False, default=None,
-                        help="W&B run ID (e.g. '7tyjzwiz'). Find it in your run's URL.")
+                        help="W&B run ID (e.g. 'xm5xjq8g'). This is the short alphanumeric string "
+                             "in the run URL — NOT the human-readable name like 'crimson-wood-4'.")
     parser.add_argument("--local-checkpoint", required=False, default=None,
                         help="Path to a local .pkl checkpoint file. Use instead of --run-id.")
     parser.add_argument("--prompt",     required=True,
