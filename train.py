@@ -208,7 +208,7 @@ def make_train_step(optimizer):
 # genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 32
+BATCH_SIZE = 16  # Metal GPU memory limit: logits (bs × seq_len × 50257) fits up to ~bs=20
 CHECKPOINT_EVERY = 500
 
 # ---------------------------------------------------------------------------

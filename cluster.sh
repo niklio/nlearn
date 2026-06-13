@@ -75,7 +75,7 @@ usage() {
   echo "      Logs metrics to W&B and saves checkpoints to checkpoints/."
   echo "      --n_steps <n>               Training steps (default: 5000)"
   echo "      --seq_len <n>               Sequence length (default: 512)"
-  echo "      --batch_size <n>            Batch size (default: 32)"
+  echo "      --batch_size <n>            Batch size (default: 16; max ~20 on Metal GPU)"
   echo "      --peak_lr <f>               Peak learning rate (default: 1e-3)"
   echo "      --seed <n>                  Random seed (default: 0)"
   echo "      --run_name <str>            W&B run name (default: auto-generated)"

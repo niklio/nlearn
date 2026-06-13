@@ -1,5 +1,7 @@
-jax-metal
-optax
+jax==0.4.26
+jaxlib==0.4.26
+jax-metal==0.1.0
+optax==0.1.9
 wandb
 datasets
 tiktoken
