@@ -1,22 +1,22 @@
 """
-data.py — Prepare FineWeb-Edu training data.
+data.py — Stream and prepare a HuggingFace dataset for training.
 
-Streams FineWeb-Edu from HuggingFace, (optionally) retrains the BPE tokenizer
-on a sample, then tokenizes the full target corpus and writes it to a binary
-file that train.py can memory-map directly — no RAM required at training time.
+Streams a dataset from HuggingFace, (optionally) retrains the BPE tokenizer
+on a sample, then tokenizes the corpus and writes it to a binary file that
+train.py can memory-map directly — no RAM required at training time.
 
 Usage:
-    # Full pipeline: retrain tokenizer + write 500M tokens to disk
-    python3 data.py --target-tokens 500_000_000
-
-    # Skip tokenizer retraining (use existing tokenizer.json)
-    python3 data.py --target-tokens 500_000_000 --no-retrain-tokenizer
+    # FineWeb-Edu, 500M tokens
+    python3 data.py --dataset fineweb-edu --target-tokens 500_000_000
 
     # Quick test with 10M tokens
-    python3 data.py --target-tokens 10_000_000
+    python3 data.py --dataset fineweb-edu --target-tokens 10_000_000
+
+    # Different dataset, skip tokenizer retraining
+    python3 data.py --dataset c4 --target-tokens 100_000_000 --no-retrain-tokenizer
 
 Output:
-    datasets/fineweb.bin      — flat uint16 array of token IDs
+    datasets/<dataset>.bin    — flat uint16 array of token IDs
     tokenizer.json            — updated BPE tokenizer (unless --no-retrain-tokenizer)
 """
 
@@ -31,69 +31,88 @@ from tokenizer import train as train_bpe, encode as bpe_encode, load_tokenizer
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-DATASET_NAME   = "HuggingFaceFW/fineweb-edu"
-DATASET_CONFIG = "sample-10BT"
-# FineWeb-Edu comes in several sizes on HuggingFace:
-#   "sample-10BT"  — 10 billion tokens of educational web text (~50GB raw)
-#   "sample-100BT" — 100 billion tokens
-#   "default"      — full dataset (~1.3TB)
-# We stream from it so none of this downloads upfront — we just read until
-# we have as many tokens as we need.
-
 TOKENIZER_SAMPLE_CHARS = 10_000_000
-# How many characters to sample from FineWeb-Edu for BPE tokenizer training.
-# 10M chars is enough to learn good merge rules for web text vocabulary.
-# The tokenizer training itself takes ~2-5 minutes on this size.
+# How many characters to sample for BPE tokenizer training.
+# 10M chars is enough to learn good merge rules for any English corpus.
 
 BPE_VOCAB_SIZE = 8000
-# Larger than our Shakespeare tokenizer (4000) since web text has a much
-# richer and more diverse vocabulary — more languages, technical terms, URLs etc.
-# 8000 is a good balance between coverage and embedding table size.
+# Larger than our Shakespeare tokenizer (4000) since web text has a richer
+# vocabulary. 8000 is a good balance between coverage and embedding table size.
 
-OUTPUT_DIR  = "datasets"
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "fineweb.bin")
-# Binary output file. Stored as uint16 (2 bytes per token).
-# uint16 supports vocab sizes up to 65,536 — plenty for our 8000-token vocab.
-# 500M tokens × 2 bytes = 1GB on disk.
+OUTPUT_DIR = "datasets"
+
+# ---------------------------------------------------------------------------
+# DATASET REGISTRY
+#
+# Maps a short name → (hf_dataset, hf_config, text_field)
+# Add new datasets here to make them available via --dataset.
+#
+# hf_dataset:  HuggingFace dataset identifier (owner/name)
+# hf_config:   dataset config/subset name (None for default)
+# text_field:  the field in each example that contains the raw text
+# ---------------------------------------------------------------------------
+
+DATASETS = {
+    "fineweb-edu": {
+        "hf_dataset":  "HuggingFaceFW/fineweb-edu",
+        "hf_config":   "sample-10BT",
+        "text_field":  "text",
+    },
+    "c4": {
+        "hf_dataset":  "allenai/c4",
+        "hf_config":   "en",
+        "text_field":  "text",
+    },
+    "openwebtext": {
+        "hf_dataset":  "Skylion007/openwebtext",
+        "hf_config":   None,
+        "text_field":  "text",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
 # STEP 1: STREAM TEXT FROM FINEWEB-EDU
 # ---------------------------------------------------------------------------
 
-def stream_text(target_chars, verbose=True):
+def stream_text(dataset_cfg, target_chars, verbose=True):
     """
-    Stream raw text from FineWeb-Edu until we have target_chars characters.
+    Stream raw text from a HuggingFace dataset until we have target_chars characters.
 
     HuggingFace streaming never downloads the full dataset — it fetches
-    shards on demand as you iterate. This means we can stop at any point
-    and only the data we actually read gets downloaded.
+    shards on demand as you iterate. We can stop at any point and only
+    the data we actually read gets downloaded.
 
+    dataset_cfg:  dict from DATASETS registry with hf_dataset, hf_config, text_field
     target_chars: how many characters of text to collect
-    Returns: a single string of concatenated document text
+    Returns:      a single string of concatenated document text
     """
+    hf_dataset  = dataset_cfg["hf_dataset"]
+    hf_config   = dataset_cfg["hf_config"]
+    text_field  = dataset_cfg["text_field"]
+
     if verbose:
-        print(f"Streaming text from {DATASET_NAME} ({DATASET_CONFIG})...")
+        label = f"{hf_dataset}" + (f" ({hf_config})" if hf_config else "")
+        print(f"Streaming text from {label}...")
         print(f"Target: {target_chars:,} characters\n")
 
     dataset = load_dataset(
-        DATASET_NAME,
-        name=DATASET_CONFIG,
+        hf_dataset,
+        name=hf_config,       # None is fine here — uses the default config.
         split="train",
         streaming=True,       # Don't download — stream shard by shard.
         trust_remote_code=True,
     )
     # streaming=True returns an IterableDataset — you iterate over it like a
-    # generator. Each item is a dict with keys like 'text', 'url', 'score'.
-    # FineWeb-Edu's 'score' field is an educational quality rating (1-5).
+    # generator. Each item is a dict whose keys depend on the dataset.
 
     chunks = []
     total_chars = 0
 
     for example in dataset:
-        text = example['text']
-        # Each example is one web document — anywhere from a few hundred
-        # to tens of thousands of characters.
+        text = example[text_field]
+        # Extract the text field — different datasets use different key names,
+        # which is why we store text_field in the registry.
 
         chunks.append(text)
         chunks.append('\n\n')
@@ -110,7 +129,7 @@ def stream_text(target_chars, verbose=True):
 
     result = ''.join(chunks)
     if verbose:
-        print(f"\nCollected {len(result):,} characters from FineWeb-Edu.")
+        print(f"\nCollected {len(result):,} characters.")
     return result
 
 
@@ -199,39 +218,48 @@ def tokenize_and_write(text, char_to_id, merges, output_path, chunk_size=100_000
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare FineWeb-Edu training data.")
+    parser = argparse.ArgumentParser(description="Stream and prepare a HuggingFace dataset for training.")
 
+    parser.add_argument("--dataset",        required=True,
+                        choices=list(DATASETS.keys()),
+                        help=f"Dataset to download. Available: {', '.join(DATASETS.keys())}")
     parser.add_argument("--target-tokens",  type=int, default=50_000_000,
                         help="Approx number of tokens to write to disk (default: 50M).")
     parser.add_argument("--no-retrain-tokenizer", action="store_true",
                         help="Skip tokenizer retraining and use existing tokenizer.json.")
     parser.add_argument("--vocab-size",     type=int, default=BPE_VOCAB_SIZE,
                         help=f"BPE vocabulary size if retraining (default: {BPE_VOCAB_SIZE}).")
-    parser.add_argument("--output",         default=OUTPUT_FILE,
-                        help=f"Output binary file path (default: {OUTPUT_FILE}).")
+    parser.add_argument("--output",         default=None,
+                        help="Output binary file path. Defaults to datasets/<dataset>.bin")
 
     args = parser.parse_args()
 
-    # Estimate characters needed — BPE gives ~3-4x compression on English web text,
-    # so to get N tokens we need roughly 3.5*N characters.
+    dataset_cfg = DATASETS[args.dataset]
+    # Look up the HuggingFace path, config, and text field for this dataset.
+
+    output_path = args.output or os.path.join(OUTPUT_DIR, f"{args.dataset}.bin")
+    # Default output name is derived from the dataset name:
+    # --dataset fineweb-edu → datasets/fineweb-edu.bin
+    # --dataset c4          → datasets/c4.bin
+
+    # Estimate characters needed — BPE gives ~3-4x compression on English web text.
     target_chars = int(args.target_tokens * 3.5)
 
     # --- Stream text ---
-    full_text = stream_text(target_chars)
+    full_text = stream_text(dataset_cfg, target_chars)
 
     # --- Retrain tokenizer (or load existing) ---
     if args.no_retrain_tokenizer:
         print("\nLoading existing tokenizer.json...")
         vocab, merges, char_to_id = load_tokenizer('tokenizer.json')
     else:
-        # Use the first TOKENIZER_SAMPLE_CHARS chars for tokenizer training.
         sample = full_text[:TOKENIZER_SAMPLE_CHARS]
         vocab, merges, char_to_id = retrain_tokenizer(sample, args.vocab_size)
 
     # --- Tokenize and write ---
-    n_tokens = tokenize_and_write(full_text, char_to_id, merges, args.output)
+    n_tokens = tokenize_and_write(full_text, char_to_id, merges, output_path)
 
-    print(f"\nReady to train. Update train.py to use: datasets/fineweb.bin")
+    print(f"\nReady to train. Pass to train.py: --data {output_path}")
     print(f"Total tokens available: {n_tokens:,}")
 
 

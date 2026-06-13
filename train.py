@@ -223,7 +223,7 @@ import numpy as np
 #     local experiments when fineweb.bin hasn't been prepared yet.
 # ---------------------------------------------------------------------------
 
-FINEWEB_BIN = "datasets/fineweb.bin"
+FINEWEB_BIN = "datasets/fineweb-edu.bin"
 
 print("Loading BPE tokenizer...")
 _vocab, _merges, _char_to_id = load_tokenizer('tokenizer.json')
@@ -251,7 +251,7 @@ def load_data():
         print(f"Loaded FineWeb-Edu: {len(data):,} tokens from {FINEWEB_BIN}")
         return data
     else:
-        print(f"{FINEWEB_BIN} not found — falling back to Shakespeare.")
+        print(f"{FINEWEB_BIN} not found — falling back to Shakespeare. Run: python3 data.py --dataset fineweb-edu --target-tokens 500_000_000")
         with open('datasets/shakespeare.txt', 'r') as f:
             text = f.read()
         data = encode(text)
@@ -264,10 +264,11 @@ def load_data():
 # ---------------------------------------------------------------------------
 
 def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR, run_name=None):
+    warmup = min(WARMUP_STEPS, n_steps // 5)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
-        warmup_steps=WARMUP_STEPS,
+        warmup_steps=warmup,
         decay_steps=n_steps,
         end_value=peak_lr / 10,
     )

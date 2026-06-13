@@ -1,0 +1,5 @@
+jax[cpu]
+optax
+wandb
+datasets
+numpy

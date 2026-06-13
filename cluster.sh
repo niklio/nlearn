@@ -15,16 +15,88 @@ source "$CLUSTER_CONF"
 : "${CLUSTER_DIR:?CLUSTER_DIR not set in .cluster.conf}"
 
 SSH="${CLUSTER_USER}@${CLUSTER_HOST}"
+SENTINEL="${REPO_ROOT}/.cluster_ready"
+
+rssh() {
+  ssh "$SSH" "export PATH=/opt/homebrew/bin:\$PATH; $*"
+}
 
 usage() {
   echo "Usage: ./cluster.sh <command> [args]"
   echo ""
-  echo "  <script> [args]   Sync code and submit <script>.py (or .sh) as a queued job"
-  echo "  jobs              Show queue status"
-  echo "  logs <id>         Tail live output for a job"
-  echo "  cancel <id>       Remove a pending job"
-  echo "  sync              Sync code to cluster without submitting"
-  echo "  setup             First-time cluster bootstrap (installs pueue, creates remote dir)"
+  echo "JOB COMMANDS"
+  echo "  <script> [args]"
+  echo "      Sync code to the cluster and submit <script> as a queued job."
+  echo "      Looks for <script>.py, <script>.sh, or an executable named <script>."
+  echo "      All extra args are passed through to the script."
+  echo "      Examples:"
+  echo "        ./cluster.sh train --n_steps 50000 --batch_size 32"
+  echo "        ./cluster.sh data --dataset fineweb-edu --target-tokens 500_000_000"
+  echo ""
+  echo "  jobs"
+  echo "      Show the pueue job queue: all pending, running, and completed jobs."
+  echo ""
+  echo "  logs <id>"
+  echo "      Tail live output from a running or completed job."
+  echo "      <id> is the numeric job ID shown by 'jobs'."
+  echo "      Example: ./cluster.sh logs 4"
+  echo ""
+  echo "  cancel <id>"
+  echo "      Remove a pending job from the queue (cannot cancel a running job)."
+  echo "      Example: ./cluster.sh cancel 4"
+  echo ""
+  echo "  kill <id>"
+  echo "      Kill a running job immediately."
+  echo "      Example: ./cluster.sh kill 6"
+  echo ""
+  echo "CLUSTER MANAGEMENT"
+  echo "  sync"
+  echo "      Sync local code to the cluster without submitting a job."
+  echo "      Excludes: datasets/, checkpoints/, wandb/, __pycache__, *.pkl, .cluster.conf"
+  echo ""
+  echo "  setup"
+  echo "      Re-run full cluster bootstrap: installs pueue, creates remote dir,"
+  echo "      syncs code, and installs Python dependencies from requirements.txt."
+  echo "      Runs automatically on first use of any command."
+  echo ""
+  echo "SCRIPTS"
+  echo "  data --dataset <name> [options]"
+  echo "      Stream a HuggingFace dataset, retrain the BPE tokenizer, and write"
+  echo "      a binary token file to datasets/<name>.bin."
+  echo "      --dataset <name>            fineweb-edu | c4 | openwebtext  (required)"
+  echo "      --target-tokens <n>         Tokens to write (default: 50M)"
+  echo "      --no-retrain-tokenizer      Skip BPE retraining, use existing tokenizer.json"
+  echo "      --vocab-size <n>            BPE vocab size if retraining (default: 8000)"
+  echo "      --output <path>             Output path (default: datasets/<dataset>.bin)"
+  echo "      Example: ./cluster.sh data --dataset fineweb-edu --target-tokens 500_000_000"
+  echo ""
+  echo "  train [options]"
+  echo "      Train the transformer on datasets/fineweb-edu.bin (or Shakespeare fallback)."
+  echo "      Logs metrics to W&B and saves checkpoints to checkpoints/."
+  echo "      --n_steps <n>               Training steps (default: 5000)"
+  echo "      --seq_len <n>               Sequence length (default: 512)"
+  echo "      --batch_size <n>            Batch size (default: 32)"
+  echo "      --peak_lr <f>               Peak learning rate (default: 1e-3)"
+  echo "      --seed <n>                  Random seed (default: 0)"
+  echo "      --run_name <str>            W&B run name (default: auto-generated)"
+  echo "      Example: ./cluster.sh train --n_steps 50000 --batch_size 32"
+  echo ""
+  echo "  generate --prompt <text> --n-tokens <n> [options]"
+  echo "      Generate text from a trained checkpoint."
+  echo "      --prompt <text>             Input text to continue from  (required)"
+  echo "      --n-tokens <n>              Number of new tokens to generate  (required)"
+  echo "      --local-checkpoint <path>   Local .pkl checkpoint file"
+  echo "      --run-id <id>               W&B run ID to download checkpoint from"
+  echo "      --temperature <f>           Sampling temperature (default: 0.8)"
+  echo "      --tokenizer <path>          Path to tokenizer.json (default: tokenizer.json)"
+  echo "      --project <str>             W&B project name (default: nlearn-transformer)"
+  echo "      Example: ./cluster.sh generate --local-checkpoint checkpoints/step_005000.pkl --prompt 'Hello' --n-tokens 100"
+  echo ""
+  echo "CONFIGURATION"
+  echo "  Cluster connection is read from .cluster.conf (copy from .cluster.conf.example):"
+  echo "    CLUSTER_HOST  — hostname or IP of the remote machine"
+  echo "    CLUSTER_USER  — SSH username"
+  echo "    CLUSTER_DIR   — remote path where code is synced (e.g. ~/nlearn)"
 }
 
 sync_code() {
@@ -36,22 +108,49 @@ sync_code() {
             --exclude='__pycache__/' \
             --exclude='*.pkl' \
             --exclude='.cluster.conf' \
+            --exclude='.cluster_ready' \
             "${REPO_ROOT}/" \
             "${SSH}:${CLUSTER_DIR}/"
   echo "Sync complete."
 }
 
+do_setup() {
+  echo "Bootstrapping cluster..."
+  rssh "brew install pueue && brew services start pueue || true"
+  rssh "mkdir -p ${CLUSTER_DIR}"
+  sync_code
+  echo "Installing Python dependencies..."
+  rssh "pip3 install -r ${CLUSTER_DIR}/requirements.txt"
+  rssh "pueue status"
+  touch "$SENTINEL"
+  echo "Cluster ready."
+}
+
+# Auto-setup on first use; auto-sync before every command.
+ensure_ready() {
+  if [ ! -f "$SENTINEL" ]; then
+    do_setup
+  else
+    sync_code
+  fi
+}
+
 case "${1:-}" in
   jobs)
-    ssh "$SSH" "pueue status"
+    ensure_ready
+    rssh "pueue status"
     ;;
 
   logs)
-    ssh "$SSH" "pueue follow ${2:?Usage: ./cluster.sh logs <job-id>}"
+    rssh "pueue follow ${2:?Usage: ./cluster.sh logs <job-id>}"
     ;;
 
   cancel)
-    ssh "$SSH" "pueue remove ${2:?Usage: ./cluster.sh cancel <job-id>}"
+    rssh "pueue remove ${2:?Usage: ./cluster.sh cancel <job-id>}"
+    ;;
+
+  kill)
+    rssh "pueue kill ${2:?Usage: ./cluster.sh kill <job-id>}"
     ;;
 
   sync)
@@ -59,12 +158,7 @@ case "${1:-}" in
     ;;
 
   setup)
-    echo "Bootstrapping cluster..."
-    ssh "$SSH" "brew install pueue && brew services start pueue || true"
-    ssh "$SSH" "mkdir -p ${CLUSTER_DIR}"
-    sync_code
-    ssh "$SSH" "pueue status"
-    echo "Cluster ready."
+    do_setup
     ;;
 
   ""|help|--help)
@@ -77,7 +171,7 @@ case "${1:-}" in
     ARGS="$*"
 
     if [ -f "${REPO_ROOT}/${SCRIPT}.py" ]; then
-      CMD="python ${SCRIPT}.py ${ARGS}"
+      CMD="python3 ${SCRIPT}.py ${ARGS}"
     elif [ -f "${REPO_ROOT}/${SCRIPT}.sh" ]; then
       CMD="bash ${SCRIPT}.sh ${ARGS}"
     elif [ -f "${REPO_ROOT}/${SCRIPT}" ] && [ -x "${REPO_ROOT}/${SCRIPT}" ]; then
@@ -87,11 +181,17 @@ case "${1:-}" in
       exit 1
     fi
 
-    sync_code
+    ensure_ready
 
-    FULL_CMD="cd ${CLUSTER_DIR} && ${CMD}"
+    # Write the job as a script file piped through stdin — avoids all quoting issues
+    # across the local shell → SSH → remote shell → pueue chain.
+    JOB_SCRIPT="/tmp/cluster_job_$(date +%s).sh"
+    printf '#!/bin/bash\nexport PATH=/opt/homebrew/bin:$PATH\ncd %s\n%s\n' \
+      "${CLUSTER_DIR}" "${CMD}" \
+      | ssh "$SSH" "cat > ${JOB_SCRIPT} && chmod +x ${JOB_SCRIPT}"
+
     echo "Submitting: ${CMD}"
-    ssh "$SSH" "pueue add -- bash -c '${FULL_CMD}'"
-    ssh "$SSH" "pueue status"
+    rssh "pueue add -- bash ${JOB_SCRIPT}"
+    rssh "pueue status"
     ;;
 esac
