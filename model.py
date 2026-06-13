@@ -506,8 +506,14 @@ def generate(params, prompt_ids, n_tokens, key, temperature=1.0):
     # Start with the prompt. We'll append to this array one token at a time.
 
     for _ in range(n_tokens):
-        # --- Step 1: Run forward pass on current sequence ---
-        logits = model_forward(params, tokens)
+        # --- Step 1: Truncate to context window and run forward pass ---
+        context = tokens[-MAX_SEQ_LEN:]
+        # As generation continues, the sequence grows beyond MAX_SEQ_LEN.
+        # We can't process more tokens than we have positional embeddings for,
+        # so we take only the most recent MAX_SEQ_LEN tokens.
+        # This is exactly what real LLMs do — older context falls off the left edge.
+
+        logits = model_forward(params, context)
         # Shape: (seq_len, VOCAB_SIZE)
         # logits[i] = scores for the token that follows position i.
 
