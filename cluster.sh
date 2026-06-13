@@ -172,7 +172,7 @@ case "${1:-}" in
     ARGS="$*"
 
     if [ -f "${REPO_ROOT}/${SCRIPT}.py" ]; then
-      CMD="python3 ${SCRIPT}.py ${ARGS}"
+      CMD="python3 -u ${SCRIPT}.py ${ARGS}"
     elif [ -f "${REPO_ROOT}/${SCRIPT}.sh" ]; then
       CMD="bash ${SCRIPT}.sh ${ARGS}"
     elif [ -f "${REPO_ROOT}/${SCRIPT}" ] && [ -x "${REPO_ROOT}/${SCRIPT}" ]; then
