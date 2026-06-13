@@ -2,6 +2,7 @@ import jax                          # Core JAX: autodiff, JIT
 import jax.numpy as jnp              # JAX NumPy for array operations
 from jax import random               # Explicit random key management
 import optax                         # JAX optimizer library (Adam, SGD, etc.)
+import wandb                         # Weights & Biases experiment tracking
 
 from model import init_model, model_forward, generate, VOCAB_SIZE
 
@@ -162,14 +163,28 @@ def decode(token_ids):
 # SECTION 5: TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def train(n_steps=200, seq_len=32, seed=0):
+def train(n_steps=2000, seq_len=32, seed=0):
     """
-    Trains the model for n_steps gradient updates and prints progress.
+    Trains the model for n_steps gradient updates and logs to Weights & Biases.
 
     n_steps:  total number of parameter updates to perform
     seq_len:  length of each training sequence (chunk of the training text)
     seed:     random seed for reproducibility
     """
+
+    wandb.init(
+        project="nlearn-transformer",   # Groups all runs under this project name in W&B.
+        config={                         # Log hyperparameters so you can compare runs later.
+            "n_steps":     n_steps,
+            "seq_len":     seq_len,
+            "learning_rate": LEARNING_RATE,
+            "d_model":     128,
+            "n_heads":     4,
+            "n_layers":    4,
+            "d_ff":        512,
+            "vocab_size":  VOCAB_SIZE,
+        }
+    )
 
     key = random.PRNGKey(seed)         # Initialize the PRNG key.
     key, model_key = random.split(key) # Split off a key for model initialization.
@@ -201,20 +216,30 @@ def train(n_steps=200, seq_len=32, seed=0):
         # --- Gradient update ---
         params, opt_state, loss = train_step(params, opt_state, chunk)
 
-        # --- Log progress ---
-        if step % 20 == 0:
+        # --- Log to W&B every step, print every 100 ---
+        wandb.log({"loss": float(loss), "step": step})
+        # wandb.log() sends a dict of metrics to the W&B dashboard.
+        # float(loss) converts the JAX scalar to a plain Python float.
+        # W&B automatically plots these as a live loss curve.
+
+        if step % 100 == 0:
             print(f"Step {step:>4}  loss: {loss:.4f}")
 
     print("\nTraining complete.")
-    print(f"Final loss: {loss:.4f}")
-    print("(A well-trained model on this tiny dataset should reach loss < 1.0)\n")
+    print(f"Final loss: {loss:.4f}\n")
 
-    # --- Generate some text to see if the model learned anything ---
+    # --- Generate some text and log it to W&B ---
     print("Generating text from prompt 'hello'...")
     key, gen_key = random.split(key)
     prompt_ids = encode("hello")
     output_ids = generate(params, prompt_ids, n_tokens=40, key=gen_key, temperature=0.8)
-    print(f"Output: \"{decode(output_ids)}\"\n")
+    output_text = decode(output_ids)
+    print(f"Output: \"{output_text}\"\n")
+
+    wandb.log({"generated_text": wandb.Html(f"<pre>{output_text}</pre>")})
+    # Log the generated text to W&B so you can see it in the dashboard alongside the loss curve.
+
+    wandb.finish()  # Marks the run as complete in W&B.
 
     return params
 
