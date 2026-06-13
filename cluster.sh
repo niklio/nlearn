@@ -119,19 +119,20 @@ do_setup() {
   rssh "brew install pueue && brew services start pueue || true"
   rssh "mkdir -p ${CLUSTER_DIR}"
   sync_code
-  echo "Installing Python dependencies..."
   rssh "pip3 install -r ${CLUSTER_DIR}/requirements.txt"
   rssh "pueue status"
   touch "$SENTINEL"
   echo "Cluster ready."
 }
 
-# Auto-setup on first use; auto-sync before every command.
+# Sync code and ensure deps are installed before every command.
+# pip install is a no-op for packages already at the right version.
 ensure_ready() {
   if [ ! -f "$SENTINEL" ]; then
     do_setup
   else
     sync_code
+    rssh "pip3 install -q -r ${CLUSTER_DIR}/requirements.txt"
   fi
 }
 
