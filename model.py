@@ -471,3 +471,76 @@ def model_forward(params, token_ids):
     # To get probabilities: jax.nn.softmax(logits, axis=-1)
 
     return logits
+
+
+# ---------------------------------------------------------------------------
+# SECTION 5: TEXT GENERATION
+#
+# The model outputs logits — raw scores over the vocabulary for each position.
+# To generate text, we:
+#   1. Take the logits at the last position (the next-token prediction)
+#   2. Convert to probabilities via softmax
+#   3. Sample a token from that distribution
+#   4. Append it to the sequence and repeat
+#
+# The "temperature" parameter controls randomness:
+#   - temperature = 1.0  → sample from the raw distribution (default)
+#   - temperature < 1.0  → sharper distribution, more predictable/repetitive
+#   - temperature > 1.0  → flatter distribution, more random/creative
+# ---------------------------------------------------------------------------
+
+def generate(params, prompt_ids, n_tokens, key, temperature=1.0):
+    """
+    Autoregressively generates n_tokens new tokens given a prompt.
+
+    params:      full model parameter dict from init_model()
+    prompt_ids:  1D integer array of starting token IDs
+    n_tokens:    how many new tokens to generate
+    key:         JAX PRNG key for sampling
+    temperature: float controlling randomness (default 1.0)
+
+    Returns: 1D integer array of shape (len(prompt_ids) + n_tokens,)
+    """
+
+    tokens = prompt_ids
+    # Start with the prompt. We'll append to this array one token at a time.
+
+    for _ in range(n_tokens):
+        # --- Step 1: Run forward pass on current sequence ---
+        logits = model_forward(params, tokens)
+        # Shape: (seq_len, VOCAB_SIZE)
+        # logits[i] = scores for the token that follows position i.
+
+        next_logits = logits[-1]
+        # Take only the last row — the prediction for what comes after the final token.
+        # Shape: (VOCAB_SIZE,)
+
+        # --- Step 2: Apply temperature ---
+        next_logits = next_logits / temperature
+        # Dividing by temperature < 1 makes the scores more spread out (sharper peaks).
+        # Dividing by temperature > 1 compresses the scores closer together (flatter).
+        # At temperature = 1.0 this is a no-op.
+
+        # --- Step 3: Convert logits to probabilities ---
+        probs = jax.nn.softmax(next_logits)
+        # Softmax: exp(logit_i) / sum(exp(logit_j) for all j)
+        # Turns raw scores into a probability distribution that sums to 1.
+        # Shape: (VOCAB_SIZE,)
+
+        # --- Step 4: Sample one token from the distribution ---
+        key, subkey = random.split(key)
+        # Split the key before each use — JAX requires a fresh key per random call.
+
+        next_token = random.categorical(subkey, next_logits)
+        # random.categorical draws one sample from a categorical distribution.
+        # It takes logits directly (applies softmax internally), returns an integer index.
+        # That index is the sampled token ID.
+        # Shape: scalar integer.
+
+        # --- Step 5: Append sampled token to sequence ---
+        tokens = jnp.append(tokens, next_token)
+        # jnp.append concatenates the new token onto the end of the sequence.
+        # Next iteration, the model sees one more token and predicts the one after that.
+
+    return tokens
+    # Shape: (len(prompt_ids) + n_tokens,) — the full sequence including the original prompt.
