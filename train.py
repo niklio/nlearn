@@ -206,11 +206,25 @@ def make_train_step(optimizer):
 BATCH_SIZE = 32
 CHECKPOINT_EVERY = 500
 
-with open('datasets/shakespeare.txt', 'r') as f:
-    TRAINING_TEXT = f.read()
+import numpy as np
 
-# Load the BPE tokenizer trained on Shakespeare.
-# This gives us encode/decode that use 4000 subword tokens instead of 256 ASCII bytes.
+# ---------------------------------------------------------------------------
+# DATA LOADING
+#
+# Supports two modes, selected by whether datasets/fineweb.bin exists:
+#
+#   Binary mode (FineWeb-Edu):
+#     numpy.memmap reads the pre-tokenized binary file directly from disk.
+#     The OS pages in only the chunks actually accessed — the full file
+#     never loads into RAM. This scales to arbitrarily large datasets.
+#
+#   Text mode (Shakespeare fallback):
+#     Loads shakespeare.txt, encodes with BPE tokenizer. Used for quick
+#     local experiments when fineweb.bin hasn't been prepared yet.
+# ---------------------------------------------------------------------------
+
+FINEWEB_BIN = "datasets/fineweb.bin"
+
 print("Loading BPE tokenizer...")
 _vocab, _merges, _char_to_id = load_tokenizer('tokenizer.json')
 
@@ -221,6 +235,28 @@ def encode(text):
 def decode(token_ids):
     """Decode BPE token IDs back to text."""
     return bpe_decode([int(t) for t in token_ids], _vocab)
+
+def load_data():
+    """
+    Load training data. Uses fineweb.bin if available, otherwise Shakespeare.
+    Returns a 1D integer array of token IDs.
+    """
+    if os.path.exists(FINEWEB_BIN):
+        data = np.memmap(FINEWEB_BIN, dtype=np.uint16, mode='r')
+        # np.memmap maps the file into virtual memory — reads happen on demand
+        # from disk without loading everything into RAM.
+        # dtype=uint16 matches what data.py wrote (2 bytes per token).
+        data = jnp.array(data, dtype=jnp.int32)
+        # Convert to int32 for JAX indexing compatibility.
+        print(f"Loaded FineWeb-Edu: {len(data):,} tokens from {FINEWEB_BIN}")
+        return data
+    else:
+        print(f"{FINEWEB_BIN} not found — falling back to Shakespeare.")
+        with open('datasets/shakespeare.txt', 'r') as f:
+            text = f.read()
+        data = encode(text)
+        print(f"Loaded Shakespeare: {len(data):,} tokens")
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +288,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
             "n_layers":     4,
             "d_ff":         512,
             "vocab_size":   VOCAB_SIZE,
-            "dataset":      "tinyshakespeare",
+            "dataset":      "fineweb-edu" if os.path.exists(FINEWEB_BIN) else "tinyshakespeare",
             "tokenizer":    "bpe-4000",
             "warmup_steps": WARMUP_STEPS,
         }
@@ -273,7 +309,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    data = encode(TRAINING_TEXT)
+    data = load_data()
     n_tokens = len(data)
     print(f"Training on {n_tokens} tokens, batch_size={batch_size}, seq_len={seq_len}")
     print(f"Running for {n_steps} steps...\n")
