@@ -1,3 +1,5 @@
+import sys
+import signal
 import jax                          # Core JAX: autodiff, JIT
 import jax.numpy as jnp              # JAX NumPy for array operations
 from jax import random               # Explicit random key management
@@ -131,23 +133,10 @@ def cross_entropy_loss(params, token_ids):
 #         warmup   cosine decay
 # ---------------------------------------------------------------------------
 
-N_STEPS      = 5000    # Total training steps — more than before to take advantage of the bigger model.
+N_STEPS      = 5000    # Total training steps.
 WARMUP_STEPS = 200     # Ramp up LR over the first 200 steps (~4% of training).
-PEAK_LR      = 1e-3    # Peak learning rate — same as our previous fixed LR.
+PEAK_LR      = 1e-3    # Peak learning rate.
 END_LR       = 1e-4    # End learning rate — decay to 10% of peak by the final step.
-
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0,           # LR starts at 0.
-    peak_value=PEAK_LR,       # Ramps up to this value over warmup_steps.
-    warmup_steps=WARMUP_STEPS,
-    decay_steps=N_STEPS,      # Total steps over which cosine decay runs.
-    end_value=END_LR,         # Final LR at the end of training.
-)
-# schedule is a function: schedule(step) → learning_rate
-# optax.adam will call it automatically each step using the step count in opt_state.
-
-optimizer = optax.adam(learning_rate=schedule)
-# Same Adam optimizer, but now with an adaptive LR that changes each step.
 
 
 # ---------------------------------------------------------------------------
@@ -191,29 +180,14 @@ loss_and_grad_fn = jax.value_and_grad(batch_loss)
 # Gradients are automatically averaged across the batch because we used jnp.mean().
 
 
-def train_step(params, opt_state, batch):
-    """
-    Performs one gradient update on a batch of sequences.
-
-    params:    current model parameters
-    opt_state: current optimizer state (Adam momentum buffers)
-    batch:     2D integer array of shape (BATCH_SIZE, seq_len+1)
-
-    Returns: (updated_params, updated_opt_state, loss_value)
-    """
-
-    loss, grads = loss_and_grad_fn(params, batch)
-    # loss:  scalar mean loss across the batch
-    # grads: same structure as params, but averaged gradients across all BATCH_SIZE sequences.
-    #        Averaging is what makes the gradient signal smoother and more reliable.
-
-    updates, opt_state = optimizer.update(grads, opt_state)
-    params = optax.apply_updates(params, updates)
-
-    return params, opt_state, loss
-
-
-train_step = jax.jit(train_step)
+def make_train_step(optimizer):
+    """Returns a JIT-compiled train step closed over the given optimizer."""
+    def train_step(params, opt_state, batch):
+        loss, grads = loss_and_grad_fn(params, batch)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+    return jax.jit(train_step)
 # jax.jit (Just-In-Time compilation) transforms train_step into a compiled GPU program.
 # First call: JAX traces the function and compiles it to optimized GPU code (~5-10s).
 # Every subsequent call: runs the compiled program directly — no Python overhead.
@@ -230,14 +204,9 @@ train_step = jax.jit(train_step)
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 32
-# Reduced from 256 → 32 because D_MODEL=512 and seq_len=512 use much more memory.
-# Attention matrices scale as batch * heads * seq_len², so going from
-# seq_len=64 to seq_len=512 is 64x more attention memory per batch element.
-
 CHECKPOINT_EVERY = 500
-# Save a checkpoint every this many steps.
 
-with open('shakespeare.txt', 'r') as f:
+with open('datasets/shakespeare.txt', 'r') as f:
     TRAINING_TEXT = f.read()
 
 # Load the BPE tokenizer trained on Shakespeare.
@@ -258,32 +227,34 @@ def decode(token_ids):
 # SECTION 5: TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def train(n_steps=N_STEPS, seq_len=512, seed=0):
-    """
-    Trains the model for n_steps gradient updates and logs to Weights & Biases.
-
-    n_steps:  total number of parameter updates to perform
-    seq_len:  length of each training sequence
-    seed:     random seed for reproducibility
-    """
+def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR, run_name=None):
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=peak_lr,
+        warmup_steps=WARMUP_STEPS,
+        decay_steps=n_steps,
+        end_value=peak_lr / 10,
+    )
+    optimizer = optax.adam(learning_rate=schedule)
+    train_step = make_train_step(optimizer)
 
     wandb.init(
         project="nlearn-transformer",
+        name=run_name,
         config={
-            "n_steps":       n_steps,
-            "seq_len":       seq_len,
-            "batch_size":    BATCH_SIZE,
-            "learning_rate": LEARNING_RATE,
-            "d_model":       128,
-            "n_heads":       4,
-            "n_layers":      4,
-            "d_ff":          512,
-            "vocab_size":    VOCAB_SIZE,
-            "dataset":       "tinyshakespeare",
-            "tokenizer":     "bpe-4000",
-            "warmup_steps":  WARMUP_STEPS,
-            "peak_lr":       PEAK_LR,
-            "end_lr":        END_LR,
+            "n_steps":      n_steps,
+            "seq_len":      seq_len,
+            "batch_size":   batch_size,
+            "peak_lr":      peak_lr,
+            "end_lr":       peak_lr / 10,
+            "d_model":      128,
+            "n_heads":      4,
+            "n_layers":     4,
+            "d_ff":         512,
+            "vocab_size":   VOCAB_SIZE,
+            "dataset":      "tinyshakespeare",
+            "tokenizer":    "bpe-4000",
+            "warmup_steps": WARMUP_STEPS,
         }
     )
 
@@ -294,32 +265,26 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0):
     params = init_model(model_key)
     opt_state = optimizer.init(params)
 
+    # Graceful interrupt: set a flag in the signal handler, check it each step.
+    _stop = {"requested": False}
+    def _handle_signal(signum, frame):
+        print("\nInterrupt received — will save checkpoint and exit after this step.")
+        _stop["requested"] = True
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     data = encode(TRAINING_TEXT)
     n_tokens = len(data)
-    print(f"Training on {n_tokens} tokens, batch_size={BATCH_SIZE}, seq_len={seq_len}")
+    print(f"Training on {n_tokens} tokens, batch_size={batch_size}, seq_len={seq_len}")
     print(f"Running for {n_steps} steps...\n")
 
+    loss = None
     for step in range(n_steps):
-
-        # --- Sample a batch of BATCH_SIZE random sequences ---
         key, subkey = random.split(key)
-
-        starts = random.randint(subkey, (BATCH_SIZE,), 0, n_tokens - seq_len - 1)
-        # Sample BATCH_SIZE random start positions simultaneously.
-        # Shape: (BATCH_SIZE,) — one starting index per sequence in the batch.
-
+        starts = random.randint(subkey, (batch_size,), 0, n_tokens - seq_len - 1)
         offsets = jnp.arange(seq_len + 1)
-        # A range [0, 1, 2, ..., seq_len]. Shape: (seq_len+1,)
-        # Adding this to each start position gives us the full index range for that sequence.
-
         batch = data[starts[:, None] + offsets[None, :]]
-        # starts[:, None] reshapes starts to (BATCH_SIZE, 1)
-        # offsets[None, :] reshapes offsets to (1, seq_len+1)
-        # Broadcasting adds them together: (BATCH_SIZE, 1) + (1, seq_len+1) → (BATCH_SIZE, seq_len+1)
-        # This is a single GPU indexing operation replacing the Python for loop.
-        # Shape: (BATCH_SIZE, seq_len+1)
 
-        # --- Gradient update ---
         params, opt_state, loss = train_step(params, opt_state, batch)
 
         wandb.log({"loss": float(loss), "step": step})
@@ -329,8 +294,12 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0):
 
         if step > 0 and step % CHECKPOINT_EVERY == 0:
             save_checkpoint(params, step)
-            # Periodic checkpoint — lets us resume training or compare
-            # weights at different points in training.
+
+        if _stop["requested"]:
+            print("Saving checkpoint before exit...")
+            save_checkpoint(params, step)
+            wandb.finish()
+            sys.exit(0)
 
     # --- Save final checkpoint ---
     final_path = save_checkpoint(params, n_steps)
@@ -365,4 +334,13 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0):
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--n_steps",    type=int,   default=N_STEPS)
+    p.add_argument("--seq_len",    type=int,   default=512)
+    p.add_argument("--seed",       type=int,   default=0)
+    p.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
+    p.add_argument("--peak_lr",    type=float, default=PEAK_LR)
+    p.add_argument("--run_name",   type=str,   default=None)
+    args = p.parse_args()
+    train(**vars(args))
