@@ -54,22 +54,16 @@ usage() {
   echo "      Sync local code to the cluster without submitting a job."
   echo "      Excludes: datasets/, checkpoints/, wandb/, __pycache__, *.pkl, .cluster.conf"
   echo ""
+  echo "  pull"
+  echo "      Rsync checkpoints/ from the cluster back to local."
+  echo "      Preserves run-name subdirectory structure."
+  echo ""
   echo "  setup"
   echo "      Re-run full cluster bootstrap: installs pueue, creates remote dir,"
   echo "      syncs code, and installs Python dependencies from requirements.txt."
   echo "      Runs automatically on first use of any command."
   echo ""
   echo "SCRIPTS"
-  echo "  data --dataset <name> [options]"
-  echo "      Stream a HuggingFace dataset, retrain the BPE tokenizer, and write"
-  echo "      a binary token file to datasets/<name>.bin."
-  echo "      --dataset <name>            fineweb-edu | c4 | openwebtext  (required)"
-  echo "      --target-tokens <n>         Tokens to write (default: 50M)"
-  echo "      --no-retrain-tokenizer      Skip BPE retraining, use existing tokenizer.json"
-  echo "      --vocab-size <n>            BPE vocab size if retraining (default: 8000)"
-  echo "      --output <path>             Output path (default: datasets/<dataset>.bin)"
-  echo "      Example: ./cluster.sh data --dataset fineweb-edu --target-tokens 500_000_000"
-  echo ""
   echo "  train [options]"
   echo "      Train the transformer on datasets/fineweb-edu.bin (or Shakespeare fallback)."
   echo "      Logs metrics to W&B and saves checkpoints to checkpoints/."
@@ -88,7 +82,6 @@ usage() {
   echo "      --local-checkpoint <path>   Local .pkl checkpoint file"
   echo "      --run-id <id>               W&B run ID to download checkpoint from"
   echo "      --temperature <f>           Sampling temperature (default: 0.8)"
-  echo "      --tokenizer <path>          Path to tokenizer.json (default: tokenizer.json)"
   echo "      --project <str>             W&B project name (default: nlearn-transformer)"
   echo "      Example: ./cluster.sh generate --local-checkpoint checkpoints/step_005000.pkl --prompt 'Hello' --n-tokens 100"
   echo ""
@@ -158,6 +151,12 @@ case "${1:-}" in
     sync_code
     ;;
 
+  pull)
+    echo "Pulling checkpoints from cluster..."
+    rsync -az "${SSH}:${CLUSTER_DIR}/checkpoints/" "${REPO_ROOT}/checkpoints/"
+    echo "Done."
+    ;;
+
   setup)
     do_setup
     ;;
@@ -192,7 +191,7 @@ case "${1:-}" in
       | ssh "$SSH" "cat > ${JOB_SCRIPT} && chmod +x ${JOB_SCRIPT}"
 
     echo "Submitting: ${CMD}"
-    rssh "pueue add -- bash ${JOB_SCRIPT}"
+    rssh "pueue add --label '${SCRIPT} ${ARGS}' -- bash ${JOB_SCRIPT}"
     rssh "pueue status"
     ;;
 esac

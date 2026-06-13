@@ -11,10 +11,11 @@ import wandb
 import pickle
 import os
 import numpy as np
-import tiktoken
 from datasets import load_dataset
 
-from model import init_model, model_forward, generate, VOCAB_SIZE
+import tiktoken
+
+from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL
 
 # ---------------------------------------------------------------------------
 # CHECKPOINTING
@@ -31,12 +32,12 @@ from model import init_model, model_forward, generate, VOCAB_SIZE
 
 CHECKPOINT_DIR = "checkpoints"
 
-def save_checkpoint(params, step):
+def save_checkpoint(params, step, run_name=None):
     """Save model parameters to disk at a given training step."""
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    # Create the checkpoints/ directory if it doesn't exist yet.
+    subdir = os.path.join(CHECKPOINT_DIR, run_name) if run_name else CHECKPOINT_DIR
+    os.makedirs(subdir, exist_ok=True)
 
-    path = os.path.join(CHECKPOINT_DIR, f"step_{step:06d}.pkl")
+    path = os.path.join(subdir, f"step_{step:06d}.pkl")
     # Zero-pad the step number so filenames sort correctly (step_000500.pkl, etc.)
 
     with open(path, 'wb') as f:
@@ -69,48 +70,90 @@ def load_checkpoint(path):
 # The loss measures how wrong the model's predictions are using cross-entropy.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# CHUNKED CROSS-ENTROPY
+#
+# The standard approach computes logits for all VOCAB_SIZE tokens at once:
+#   logits = x @ lm_head   →   (seq_len, 50257)   — 103 MB per sequence
+# Across a batch of 256 via vmap, that's ~26 GB. Metal can't hold that.
+#
+# Chunked CE avoids materialising the full logit matrix. Instead we:
+#   1. Split lm_head into VOCAB_CHUNK_SIZE columns at a time
+#   2. Stream through chunks with lax.scan, accumulating:
+#        - running log-sum-exp  (the normaliser for softmax)
+#        - the correct token's logit  (the numerator)
+#   3. Combine at the end: loss = -(correct_logit - log_sum_exp).mean()
+#
+# Peak logit memory = batch_size × seq_len × VOCAB_CHUNK_SIZE × 4 bytes
+# At bs=256, seq_len=512, chunk=1024: 536 MB vs 26 GB unChunked.
+# ---------------------------------------------------------------------------
+
+VOCAB_CHUNK_SIZE = 4096
+# 50257 is not divisible by 4096; pad to 53248 = 13 × 4096.
+_PAD          = (-VOCAB_SIZE) % VOCAB_CHUNK_SIZE           # 2991
+_PADDED_VOCAB = VOCAB_SIZE + _PAD                          # 53248
+_N_CHUNKS     = _PADDED_VOCAB // VOCAB_CHUNK_SIZE          # 13
+
+# Boolean mask: True for real vocab tokens, False for padding (only last chunk differs).
+# Shape (n_chunks, chunk_size) — passed through lax.scan to suppress padded positions.
+_VOCAB_MASK = (jnp.arange(_PADDED_VOCAB) < VOCAB_SIZE).reshape(_N_CHUNKS, VOCAB_CHUNK_SIZE)
+
+
 def cross_entropy_loss(params, token_ids):
     """
-    Computes the average cross-entropy loss over a sequence of tokens.
+    Chunked cross-entropy: same result as the naive version but never
+    materialises the full (seq_len, VOCAB_SIZE) logit matrix.
 
     params:    full model parameter dict
-    token_ids: 1D integer array of shape (seq_len,)
-    Returns:   scalar loss value (lower = better predictions)
+    token_ids: 1D integer array of shape (seq_len + 1,)
+    Returns:   scalar loss
     """
-
     input_ids  = token_ids[:-1]
-    # Drop the last token — we don't need a prediction for what comes after it.
-    # Shape: (seq_len - 1,)
-
     target_ids = token_ids[1:]
-    # Drop the first token — targets are the "correct answers" shifted left by one.
-    # Shape: (seq_len - 1,)
-    # target_ids[i] is the token the model should predict after seeing input_ids[i].
+    seq_len    = input_ids.shape[0]
 
-    logits = model_forward(params, input_ids)
-    # Run the model on the inputs. Shape: (seq_len - 1, VOCAB_SIZE)
-    # logits[i] = raw scores for all vocab tokens at position i.
+    # Hidden states before the output projection: (seq_len, D_MODEL)
+    x = model_forward_features(params, input_ids)
 
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    # log_softmax = log(softmax(x)) — equivalent but numerically more stable than
-    # computing softmax then taking log separately.
-    # Shape: (seq_len - 1, VOCAB_SIZE)
-    # log_probs[i, j] = log probability the model assigns to token j at position i.
+    # Pad lm_head with zeros (NOT -inf — that causes NaN in the matmul when
+    # x has mixed signs). We suppress padded positions via _VOCAB_MASK after.
+    W = params['lm_head']  # (D_MODEL, VOCAB_SIZE)
+    if _PAD > 0:
+        W = jnp.concatenate([W, jnp.zeros((D_MODEL, _PAD))], axis=1)
 
-    correct_log_probs = log_probs[jnp.arange(len(target_ids)), target_ids]
-    # Index into log_probs to get only the log probability of the *correct* next token.
-    # jnp.arange(len(target_ids)) = [0, 1, 2, ...] — one index per position.
-    # target_ids = [e, l, l, o, !] — the correct token ID at each position.
-    # This fancy indexing selects log_probs[0, target_ids[0]], log_probs[1, target_ids[1]], ...
-    # Shape: (seq_len - 1,)
+    # Reshape into (n_chunks, D_MODEL, chunk_size) for the loop
+    W_chunks = W.reshape(D_MODEL, _N_CHUNKS, VOCAB_CHUNK_SIZE).transpose(1, 0, 2)
 
-    loss = -jnp.mean(correct_log_probs)
-    # Cross-entropy loss = negative mean log probability of correct predictions.
-    # If the model is certain and right: log_prob ≈ 0  → loss ≈ 0 (good)
-    # If the model is uncertain or wrong: log_prob << 0 → loss is large (bad)
-    # We negate because we want to *minimize* loss, and log probs are negative.
+    # Python for-loop: JIT unrolls this statically at trace time — simpler
+    # Metal kernels than lax.scan while still capping per-step memory to
+    # (seq_len × VOCAB_CHUNK_SIZE) rather than (seq_len × VOCAB_SIZE).
+    running_max   = jnp.full((seq_len,), -jnp.inf)
+    running_sum_exp = jnp.zeros((seq_len,))
+    correct_logit = jnp.zeros((seq_len,))
 
-    return loss
+    for i in range(_N_CHUNKS):
+        chunk_start  = i * VOCAB_CHUNK_SIZE
+        chunk_logits = x @ W_chunks[i]                     # (seq_len, VOCAB_CHUNK_SIZE)
+        chunk_logits = jnp.where(_VOCAB_MASK[i], chunk_logits, -jnp.inf)
+
+        chunk_max = chunk_logits.max(axis=-1)
+        new_max   = jnp.maximum(running_max, chunk_max)
+
+        running_sum_exp = (
+            running_sum_exp * jnp.exp(running_max - new_max)
+            + jnp.exp(chunk_logits - new_max[:, None]).sum(axis=-1)
+        )
+        running_max = new_max
+
+        in_chunk      = (target_ids >= chunk_start) & (target_ids < chunk_start + VOCAB_CHUNK_SIZE)
+        safe_idx      = jnp.clip(target_ids - chunk_start, 0, VOCAB_CHUNK_SIZE - 1)
+        chunk_correct = chunk_logits[jnp.arange(seq_len), safe_idx]
+        correct_logit = jnp.where(in_chunk, chunk_correct, correct_logit)
+
+    final_max, final_sum_exp = running_max, running_sum_exp
+
+    log_Z = jnp.log(final_sum_exp) + final_max
+    return -(correct_logit - log_Z).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +251,7 @@ def make_train_step(optimizer):
 # genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 16  # Metal GPU memory limit: logits (bs × seq_len × 50257) fits up to ~bs=20
+BATCH_SIZE = 32  # Metal GPU memory limit: attention activations cap us at ~bs=32
 CHECKPOINT_EVERY = 500
 
 # ---------------------------------------------------------------------------
@@ -252,7 +295,6 @@ PREFETCH   = 4         # chunks to buffer ahead of training
 
 class StreamingLoader:
     def __init__(self, dataset_cfg, seq_len, batch_size):
-        self.enc        = tiktoken.get_encoding("gpt2")
         self.seq_len    = seq_len
         self.batch_size = batch_size
         self._q         = queue_mod.Queue(maxsize=PREFETCH)
@@ -273,10 +315,11 @@ class StreamingLoader:
             split="train",
             streaming=True,
         )
+        enc = tiktoken.get_encoding("gpt2")
         chunk = []
         for ex in cycle(ds):
-            chunk.extend(self.enc.encode(ex[cfg["text_field"]]))
-            chunk.append(self.enc.eot_token)  # document boundary
+            chunk.extend(enc.encode(ex[cfg["text_field"]]))
+            chunk.append(enc.eot_token)  # document boundary
             while len(chunk) >= CHUNK_SIZE:
                 self._q.put(np.array(chunk[:CHUNK_SIZE], dtype=np.int32))
                 chunk = chunk[CHUNK_SIZE:]
@@ -366,16 +409,16 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
             print(f"Step {step:>4}  loss: {loss:.4f}")
 
         if step > 0 and step % CHECKPOINT_EVERY == 0:
-            save_checkpoint(params, step)
+            save_checkpoint(params, step, run_name=run_name)
 
         if _stop["requested"]:
             print("Saving checkpoint before exit...")
-            save_checkpoint(params, step)
+            save_checkpoint(params, step, run_name=run_name)
             wandb.finish()
             sys.exit(0)
 
     # --- Save final checkpoint ---
-    final_path = save_checkpoint(params, n_steps)
+    final_path = save_checkpoint(params, n_steps, run_name=run_name)
     print(f"\nTraining complete. Final loss: {loss:.4f}\n")
 
     # --- Generate a sample ---

@@ -433,6 +433,22 @@ def init_model(key):
     }
 
 
+def model_forward_features(params, token_ids):
+    """
+    Forward pass through all transformer blocks, returning hidden states
+    before the final lm_head projection.
+
+    token_ids: 1D integer array of shape (seq_len,)
+    Returns:   2D float array of shape (seq_len, D_MODEL)
+    """
+    x = embed(params['embeddings'], token_ids)
+    seq_len = token_ids.shape[0]
+    mask = make_causal_mask(seq_len)
+    for block_params in params['blocks']:
+        x = block_forward(block_params, x, mask)
+    return layer_norm(params['ln_final'], x)
+
+
 def model_forward(params, token_ids):
     """
     Full forward pass: token IDs in, next-token logits out.
@@ -441,37 +457,8 @@ def model_forward(params, token_ids):
     Returns:   2D float array of shape (seq_len, VOCAB_SIZE)
                logits[i] = scores for what token comes after position i
     """
-
-    # --- Step 1: Embed tokens ---
-    x = embed(params['embeddings'], token_ids)
-    # Convert integer token IDs to vectors and add positional information.
-    # Shape: (seq_len, D_MODEL)
-
-    # --- Step 2: Build causal mask ---
-    seq_len = token_ids.shape[0]
-    mask = make_causal_mask(seq_len)
-    # Shape: (seq_len, seq_len). Built once and reused by every block.
-
-    # --- Step 3: Pass through all transformer blocks ---
-    for block_params in params['blocks']:
-        x = block_forward(block_params, x, mask)
-    # Each block refines the representation of every token.
-    # After N_LAYERS blocks, each token vector contains a rich contextual
-    # summary informed by everything that came before it.
-
-    # --- Step 4: Final layer norm ---
-    x = layer_norm(params['ln_final'], x)
-    # Normalize one last time before projecting to vocabulary.
-    # Shape unchanged: (seq_len, D_MODEL)
-
-    # --- Step 5: Project to vocabulary logits ---
-    logits = x @ params['lm_head']
-    # (seq_len, D_MODEL) @ (D_MODEL, VOCAB_SIZE) → (seq_len, VOCAB_SIZE)
-    # For each position in the sequence, we now have one score per vocabulary token.
-    # These are raw unnormalized scores (logits) — not probabilities yet.
-    # To get probabilities: jax.nn.softmax(logits, axis=-1)
-
-    return logits
+    x = model_forward_features(params, token_ids)
+    return x @ params['lm_head']
 
 
 # ---------------------------------------------------------------------------

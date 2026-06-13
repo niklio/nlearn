@@ -21,8 +21,9 @@ import tempfile
 
 import jax
 import jax.numpy as jnp
-import tiktoken
 import wandb
+
+import tiktoken
 
 from model import generate as model_generate
 

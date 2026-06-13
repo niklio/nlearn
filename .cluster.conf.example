@@ -2,3 +2,4 @@ CLUSTER_HOST=100.x.x.x       # Tailscale IP or hostname
 CLUSTER_USER=your-username   # SSH username on the cluster
 CLUSTER_DIR=/Users/your-username/nlearn   # Remote working directory (use absolute path, not ~)
 HF_TOKEN=hf_...              # HuggingFace token (get from https://huggingface.co/settings/tokens)
+WANDB_API_KEY=               # W&B API key (get from https://wandb.ai/settings)
