@@ -1,4 +1,4 @@
-jax[cpu]
+jax-metal
 optax
 wandb
 datasets
