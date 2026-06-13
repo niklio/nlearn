@@ -3,3 +3,5 @@ checkpoints/
 wandb/
 datasets/
 .cluster.conf
+.cluster_ready
+tokenizer.json
