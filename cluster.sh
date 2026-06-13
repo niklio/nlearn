@@ -187,8 +187,8 @@ case "${1:-}" in
     # Write the job as a script file piped through stdin — avoids all quoting issues
     # across the local shell → SSH → remote shell → pueue chain.
     JOB_SCRIPT="/tmp/cluster_job_$(date +%s).sh"
-    printf '#!/bin/bash\nexport PATH=/opt/homebrew/bin:$PATH\ncd %s\n%s\n' \
-      "${CLUSTER_DIR}" "${CMD}" \
+    printf '#!/bin/bash\nexport PATH=/opt/homebrew/bin:$PATH\n%s\ncd %s\n%s\n' \
+      "${HF_TOKEN:+export HF_TOKEN=${HF_TOKEN}}" "${CLUSTER_DIR}" "${CMD}" \
       | ssh "$SSH" "cat > ${JOB_SCRIPT} && chmod +x ${JOB_SCRIPT}"
 
     echo "Submitting: ${CMD}"
