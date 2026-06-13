@@ -96,37 +96,55 @@ optimizer = optax.adam(LEARNING_RATE)
 #   4. Apply updates → nudge every parameter to reduce the loss
 # ---------------------------------------------------------------------------
 
-loss_and_grad_fn = jax.value_and_grad(cross_entropy_loss)
-# jax.value_and_grad wraps any function f(params, ...) and returns a new function
-# that computes BOTH f(params, ...) AND df/d(params) in one call.
-# This is JAX's autodiff — it automatically differentiates through the entire model.
+batched_loss_fn = jax.vmap(cross_entropy_loss, in_axes=(None, 0))
+# jax.vmap (vectorized map) transforms cross_entropy_loss so it runs on a whole
+# batch at once instead of one sequence at a time.
+# in_axes=(None, 0) means:
+#   - params (first arg): don't batch over this — share the same params across all sequences
+#   - token_ids (second arg): batch over axis 0 — each row is one sequence
+# The result is a function that takes (params, batch) where batch is shape
+# (BATCH_SIZE, seq_len) and returns BATCH_SIZE loss values simultaneously.
+# JAX compiles this into efficient parallel GPU operations automatically.
 
 
-def train_step(params, opt_state, token_ids):
+def batch_loss(params, batch):
     """
-    Performs one gradient update on a single sequence.
+    Computes the mean cross-entropy loss over a batch of sequences.
+
+    params: model parameters (shared across all sequences)
+    batch:  2D integer array of shape (BATCH_SIZE, seq_len+1)
+    Returns: scalar mean loss
+    """
+    losses = batched_loss_fn(params, batch)
+    # losses shape: (BATCH_SIZE,) — one loss value per sequence in the batch.
+
+    return jnp.mean(losses)
+    # Average across the batch. This is the single number we differentiate.
+
+
+loss_and_grad_fn = jax.value_and_grad(batch_loss)
+# Same as before, but now differentiating through the batched loss.
+# Gradients are automatically averaged across the batch because we used jnp.mean().
+
+
+def train_step(params, opt_state, batch):
+    """
+    Performs one gradient update on a batch of sequences.
 
     params:    current model parameters
     opt_state: current optimizer state (Adam momentum buffers)
-    token_ids: 1D integer array — one training example
+    batch:     2D integer array of shape (BATCH_SIZE, seq_len+1)
 
     Returns: (updated_params, updated_opt_state, loss_value)
     """
 
-    loss, grads = loss_and_grad_fn(params, token_ids)
-    # loss:  scalar — the cross-entropy loss for this batch
-    # grads: a dict with the exact same structure as params, but containing
-    #        the gradient of the loss w.r.t. each parameter instead of the parameter itself.
-    #        grads['lm_head'][i,j] = "how much does the loss change if lm_head[i,j] increases?"
+    loss, grads = loss_and_grad_fn(params, batch)
+    # loss:  scalar mean loss across the batch
+    # grads: same structure as params, but averaged gradients across all BATCH_SIZE sequences.
+    #        Averaging is what makes the gradient signal smoother and more reliable.
 
     updates, opt_state = optimizer.update(grads, opt_state)
-    # Adam processes the raw gradients and computes "updates" — the actual amounts
-    # to add to each parameter. These are scaled and smoothed versions of the gradients.
-    # opt_state is updated in place (momentum buffers, step count, etc.)
-
     params = optax.apply_updates(params, updates)
-    # Adds updates to every parameter: param = param + update
-    # (updates are already negated by Adam so this reduces the loss)
 
     return params, opt_state, loss
 
@@ -134,18 +152,19 @@ def train_step(params, opt_state, token_ids):
 # ---------------------------------------------------------------------------
 # SECTION 4: TRAINING DATA
 #
-# We need text to train on. For a learning example we use a short repeated
-# string so the model has a realistic chance of memorizing it with few steps.
-# In a real system you'd load gigabytes of text from disk in shuffled batches.
+# We load TinyShakespeare — ~1.1M characters of Shakespeare plays.
+# This is large enough that the model cannot memorize it, so it must learn
+# genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-TRAINING_TEXT = (
-    "hello world. the cat sat on the mat. "
-    "the dog ran fast. a quick brown fox. "
-    "hello world. the cat sat on the mat. "
-) * 4
-# Repeat the text to give the model more exposure to the same patterns.
-# Real LLM training uses trillions of tokens — we're using ~hundreds.
+BATCH_SIZE = 16
+# How many independent sequences to process per training step.
+# Each step now computes gradients across 16 sequences and averages them,
+# giving a much smoother and more reliable gradient signal than 1 sequence.
+
+with open('shakespeare.txt', 'r') as f:
+    TRAINING_TEXT = f.read()
+# Read the entire file as a string. ~1.1M characters.
 
 def encode(text):
     """Converts a string to a JAX array of ASCII byte values (our token IDs)."""
@@ -163,64 +182,61 @@ def decode(token_ids):
 # SECTION 5: TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def train(n_steps=2000, seq_len=32, seed=0):
+def train(n_steps=1000, seq_len=64, seed=0):
     """
     Trains the model for n_steps gradient updates and logs to Weights & Biases.
 
     n_steps:  total number of parameter updates to perform
-    seq_len:  length of each training sequence (chunk of the training text)
+    seq_len:  length of each training sequence
     seed:     random seed for reproducibility
     """
 
     wandb.init(
-        project="nlearn-transformer",   # Groups all runs under this project name in W&B.
-        config={                         # Log hyperparameters so you can compare runs later.
-            "n_steps":     n_steps,
-            "seq_len":     seq_len,
+        project="nlearn-transformer",
+        config={
+            "n_steps":       n_steps,
+            "seq_len":       seq_len,
+            "batch_size":    BATCH_SIZE,
             "learning_rate": LEARNING_RATE,
-            "d_model":     128,
-            "n_heads":     4,
-            "n_layers":    4,
-            "d_ff":        512,
-            "vocab_size":  VOCAB_SIZE,
+            "d_model":       128,
+            "n_heads":       4,
+            "n_layers":      4,
+            "d_ff":          512,
+            "vocab_size":    VOCAB_SIZE,
+            "dataset":       "tinyshakespeare",
         }
     )
 
-    key = random.PRNGKey(seed)         # Initialize the PRNG key.
-    key, model_key = random.split(key) # Split off a key for model initialization.
+    key = random.PRNGKey(seed)
+    key, model_key = random.split(key)
 
     print("Initializing model...")
-    params = init_model(model_key)     # Random initial parameters.
-
+    params = init_model(model_key)
     opt_state = optimizer.init(params)
-    # Initialize Adam's state: sets up zero-filled momentum buffers for every parameter.
-    # opt_state mirrors the structure of params but holds optimizer internals, not weights.
 
-    data = encode(TRAINING_TEXT)       # Encode all training text to token IDs once.
+    data = encode(TRAINING_TEXT)
     n_tokens = len(data)
-    print(f"Training on {n_tokens} tokens for {n_steps} steps...\n")
+    print(f"Training on {n_tokens} tokens, batch_size={BATCH_SIZE}, seq_len={seq_len}")
+    print(f"Running for {n_steps} steps...\n")
 
     for step in range(n_steps):
 
-        # --- Pick a random chunk of the training data ---
-        key, subkey = random.split(key)  # Fresh key for each step.
+        # --- Sample a batch of BATCH_SIZE random sequences ---
+        key, subkey = random.split(key)
 
-        start = int(random.randint(subkey, (), 0, n_tokens - seq_len - 1))
-        # Pick a random starting position in the data.
-        # random.randint(key, shape, min, max) — shape=() means scalar output.
+        starts = random.randint(subkey, (BATCH_SIZE,), 0, n_tokens - seq_len - 1)
+        # Sample BATCH_SIZE random start positions simultaneously.
+        # Shape: (BATCH_SIZE,) — one starting index per sequence in the batch.
 
-        chunk = data[start : start + seq_len + 1]
-        # Grab seq_len + 1 tokens. The +1 is because cross_entropy_loss will
-        # use the first seq_len as input and the last seq_len as targets.
+        batch = jnp.stack([data[s : s + seq_len + 1] for s in starts])
+        # For each start index, slice out a chunk of seq_len+1 tokens.
+        # jnp.stack turns the list of 1D arrays into a 2D array.
+        # Shape: (BATCH_SIZE, seq_len+1)
 
         # --- Gradient update ---
-        params, opt_state, loss = train_step(params, opt_state, chunk)
+        params, opt_state, loss = train_step(params, opt_state, batch)
 
-        # --- Log to W&B every step, print every 100 ---
         wandb.log({"loss": float(loss), "step": step})
-        # wandb.log() sends a dict of metrics to the W&B dashboard.
-        # float(loss) converts the JAX scalar to a plain Python float.
-        # W&B automatically plots these as a live loss curve.
 
         if step % 100 == 0:
             print(f"Step {step:>4}  loss: {loss:.4f}")
@@ -228,18 +244,16 @@ def train(n_steps=2000, seq_len=32, seed=0):
     print("\nTraining complete.")
     print(f"Final loss: {loss:.4f}\n")
 
-    # --- Generate some text and log it to W&B ---
-    print("Generating text from prompt 'hello'...")
+    # --- Generate text from a Shakespeare-style prompt ---
+    print("Generating text from prompt 'ROMEO:'...")
     key, gen_key = random.split(key)
-    prompt_ids = encode("hello")
-    output_ids = generate(params, prompt_ids, n_tokens=40, key=gen_key, temperature=0.8)
+    prompt_ids = encode("ROMEO:")
+    output_ids = generate(params, prompt_ids, n_tokens=200, key=gen_key, temperature=0.8)
     output_text = decode(output_ids)
-    print(f"Output: \"{output_text}\"\n")
+    print(f"Output:\n{output_text}\n")
 
     wandb.log({"generated_text": wandb.Html(f"<pre>{output_text}</pre>")})
-    # Log the generated text to W&B so you can see it in the dashboard alongside the loss curve.
-
-    wandb.finish()  # Marks the run as complete in W&B.
+    wandb.finish()
 
     return params
 
