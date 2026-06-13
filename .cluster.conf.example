@@ -1,0 +1,3 @@
+CLUSTER_HOST=100.x.x.x       # Tailscale IP or hostname
+CLUSTER_USER=your-username   # SSH username on the cluster
+CLUSTER_DIR=~/nlearn          # Remote working directory
