@@ -13,7 +13,7 @@ motivated the whole IREE migration.
 | **True backward kernels** (`flash_attention_bwd_dq`, `flash_attention_bwd_dkdv`) | ✅ O(seq)-memory dQ/dK/dV (recompute softmax from `L`, no seq²); validated on M3 GPU vs NumPy reference — dQ 3.6e-7, dK 9.5e-7, dV 3.9e-7 (`test/flash_bwd_test.mlir`, `test/validate_flash_bwd.py`) |
 | Compiler: Metal external-object support | ✅ patched (`patches/04`): `MetalSPIRVTarget::serializeExternalExecutable` embeds a provided MSL object into the metal flatbuffer (Metal had no external path; Vulkan did). Compiler rebuilt clean. |
 | Metal dispatch ABI | ✅ reverse-engineered (see below + `abi_reference/`) |
-| Hand-MLIR trivial dispatch on Metal (iree-run-module) | ✅ `test/spike.mlir` + `spike_mul.metal`: out=2*4=8 on the M3 GPU |
+| Hand-MLIR dispatch on Metal (iree-run-module) | ✅ proven via the flash tests below |
 | FlashAttention kernel on Metal via IREE | ✅ `test/flash_test.mlir` + `validate_flash.py`: matches NumPy reference to 2.4e-7 on the GPU |
 | Frontend: `stablehlo.custom_call` → `flow.dispatch` | ⏳ patch `StableHLOCustomCalls.cpp` so JAX can invoke it |
 | `jax.ffi` wiring in `attention.py` | ⏳ |

@@ -14,9 +14,8 @@ Everything *below* the JAX frontend is proven working — the COMPLETE kernel se
 3. **`flow.dispatch` of the external objects** — `kernels/test/flash_test.mlir`
    (fwd) + `flash_bwd_test.mlir` (fwd+bwd): numerically correct on GPU.
    Forward 2.4e-7; **backward dQ 3.6e-7, dK 9.5e-7, dV 3.9e-7** vs NumPy. ✅
-4. **`hal.dispatch.extern` form** — `kernels/flash_entry_point.mlir` /
-   `flash_extern_test.mlir`: the exact IR the binding emits; correct on GPU
-   (2.38e-7). ✅
+4. **`hal.dispatch.extern` form** — `kernels/flash_entry_point.mlir`: the
+   inline-dispatch IR variant (the production pass uses `flow.dispatch`). ✅
 
 So the kernels are usable on Metal via IREE *today* through hand-MLIR.
 
@@ -38,9 +37,9 @@ even though every individual op is correct in isolation (verified vs CPU). It
 makes `_attention_standard` wrong (1.75) — the flash kernel fixes that — and
 makes train.py's 13-chunk cross-entropy drive the loss negative under
 overfitting. Workaround: a simple unchunked one-hot CE (see
-`train_flash_local.py:simple_ce`) compiles correctly. Also: gather's backward
-(scatter) miscompiles under vmap, so use one-hot select (not `take_along_axis`)
-in losses.
+`train.py:_simple_cross_entropy_loss`, auto-selected on iree_metal) compiles
+correctly. Also: gather's backward (scatter) miscompiles under vmap, so use
+one-hot select (not `take_along_axis`) in losses.
 
 ## Remaining work (the JAX frontend binding + training)
 
