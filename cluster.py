@@ -368,12 +368,12 @@ CLUSTER MANAGEMENT
   setup                   Re-run full cluster bootstrap.
 
 TRAIN OPTIONS
-  --n_steps <n>           Training steps (default: 5000)
-  --seq_len <n>           Sequence length (default: 512)
-  --batch_size <n>        Batch size (default: 32)
-  --peak_lr <f>           Peak learning rate (default: 1e-3)
+  --steps <n>             Training steps (default: 5000)
+  --seq-len <n>           Sequence length (default: 512)
+  --batch-size <n>        Batch size (default: 32)
+  --peak-lr <f>           Peak learning rate (default: 1e-3)
   --dataset <name>        fineweb-edu | c4 | openwebtext
-  --run_name <str>        W&B run name
+  --run-name <str>        W&B run name
 
 GENERATE OPTIONS
   --prompt <text>         Input text to continue from  (required)

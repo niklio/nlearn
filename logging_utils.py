@@ -99,6 +99,11 @@ class TrainingLogger:
         self._flops_per_step = estimate_flops_per_step(n_params, seq_len, batch_size)
         self._hw_peak_flops = hw_peak_tflops * 1e12  # convert TFLOPS → FLOPS
 
+        # Tell W&B to also plot loss metrics against total_flops as x-axis.
+        wandb.define_metric("loss/total_flops")
+        wandb.define_metric("loss/by_flops/*", step_metric="loss/total_flops")
+
+
     def _compute_val_loss(self, params):
         val_losses = []
         for vb in self._val_batches_fn():
@@ -118,21 +123,24 @@ class TrainingLogger:
             mfu = self._flops_per_step / (self._hw_peak_flops * timer.train_time)
 
         metrics = {
-            "loss": float(loss),
-            "step": step,
-            "step_time": timer.step_time,
-            "data_time": timer.data_time,
-            "train_time": timer.train_time,
-            "peak_memory_mb": mem_mb,
-            "mfu": mfu,
-            "total_flops": self._total_flops,
+            "loss/train": float(loss),
+            "hardware/step_time": timer.step_time,
+            "hardware/data_time": timer.data_time,
+            "hardware/train_time": timer.train_time,
+            "hardware/peak_memory_mb": mem_mb,
+            "hardware/mfu": mfu,
+            "loss/total_flops": self._total_flops,
         }
+
+        # Loss indexed by FLOPs (live-updating chart)
+        metrics["loss/by_flops/train"] = float(loss)
 
         # Periodic validation
         do_val = (step % self._val_every == 0)
         if do_val:
             val_loss = self._compute_val_loss(params)
-            metrics["val_loss"] = val_loss
+            metrics["loss/val"] = val_loss
+            metrics["loss/by_flops/val"] = val_loss
 
         # Print to console
         if do_val:
