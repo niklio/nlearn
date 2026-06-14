@@ -16,7 +16,10 @@ D_FF        = 2048     # Hidden size of the feed-forward sublayer. Kept at 4 * D
 N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
 MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
 
-COMPUTE_DTYPE = jnp.bfloat16  # Forward-pass dtype; stored params stay float32.
+COMPUTE_DTYPE    = jnp.bfloat16  # Forward-pass dtype; stored params stay float32.
+ATTN_CHUNK_SIZE  = 256           # K/V positions processed per chunk in attention.
+                                  # Peak attention memory: O(seq_len × ATTN_CHUNK_SIZE)
+                                  # instead of O(seq_len²). Enables long context.
 
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS
@@ -75,39 +78,28 @@ def embed(params, token_ids):
 
 
 # ---------------------------------------------------------------------------
-# SECTION 2: CAUSAL MASK + MULTI-HEAD ATTENTION
+# SECTION 2: MULTI-HEAD CHUNKED ATTENTION
 #
-# Attention is the mechanism that lets every token "look at" other tokens
-# and decide how much to borrow from each one.
+# Attention lets every token "look at" other tokens and borrow from them.
+# Causal masking enforces the decoder rule: token i can only attend to
+# positions 0..i (no peeking at future tokens).
 #
-# The causal mask enforces the decoder rule: token at position i can only
-# attend to positions 0..i. It cannot see the future.
+# Standard attention materialises the full (N_HEADS, seq_len, seq_len)
+# score matrix. At seq_len=2048 that is 8×2048×2048×2 bytes = 64 MB per
+# sequence — the main obstacle to longer context.
 #
-# Multi-head attention runs scaled dot-product attention N_HEADS times in
-# parallel on smaller slices of the vector, then stitches results together.
+# Chunked (memory-efficient) attention processes K/V in ATTN_CHUNK_SIZE
+# blocks and accumulates the result with an online softmax, keeping peak
+# memory at O(seq_len × ATTN_CHUNK_SIZE) regardless of total seq_len.
+#
+# Online softmax algorithm (Milakov & Gimelshein 2018):
+#   For each K/V chunk:
+#     1. Compute chunk scores = Q @ K_chunk^T / sqrt(d_head)
+#     2. Apply causal mask for this chunk's key positions
+#     3. Update running max; rescale old running sum and output
+#     4. Accumulate exp(scores) sum and exp(scores) @ V_chunk
+#   Final output = running_out / running_sum
 # ---------------------------------------------------------------------------
-
-def make_causal_mask(seq_len):
-    """
-    Builds an upper-triangular matrix of -inf values.
-    When added to attention scores, future positions become -inf,
-    which softmax turns into 0 — effectively erasing them.
-
-    Returns shape: (seq_len, seq_len)
-    """
-    mask = jnp.triu(                         # triu = "upper triangular": keeps values on and above the diagonal,
-                                             # sets everything below the diagonal to zero.
-        jnp.full((seq_len, seq_len), -jnp.inf),  # Start with a matrix entirely filled with -infinity.
-        k=1                                  # k=1 means shift the diagonal up by 1, so the diagonal itself
-                                             # becomes 0 (a token CAN attend to itself).
-    )
-    # Result looks like this for seq_len=4:
-    #   [[  0, -inf, -inf, -inf],
-    #    [  0,    0, -inf, -inf],
-    #    [  0,    0,    0, -inf],
-    #    [  0,    0,    0,    0]]
-    # Row i = "what token i is allowed to see". -inf positions get zeroed out by softmax.
-    return mask
 
 
 def init_attention(key):
@@ -142,66 +134,68 @@ def init_attention(key):
     }
 
 
-def attention_forward(params, x, mask):
+def attention_forward(params, x):
     """
-    Runs multi-head self-attention.
+    Chunked multi-head self-attention.
 
     x:    input of shape (seq_len, D_MODEL)
-    mask: causal mask of shape (seq_len, seq_len)
     Returns output of shape (seq_len, D_MODEL)
     """
-    seq_len, _ = x.shape              # Unpack sequence length; _ = D_MODEL (we already know it).
+    seq_len, _ = x.shape
+    d_head = D_MODEL // N_HEADS
+    scale  = jnp.sqrt(jnp.array(d_head, dtype=COMPUTE_DTYPE))
 
-    d_head = D_MODEL // N_HEADS       # Each head works on a slice of size d_head = 128 // 4 = 32.
+    # --- Step 1: Project and split into heads ---
+    # Each: (seq_len, D_MODEL) → reshape → (seq_len, N_HEADS, d_head)
+    #                          → transpose → (N_HEADS, seq_len, d_head)
+    Q = (x @ params['W_q']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
+    K = (x @ params['W_k']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
+    V = (x @ params['W_v']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
 
-    # --- Step 1: Project input into Q, K, V ---
+    # --- Step 2: Chunked online-softmax attention ---
+    # Process K/V in blocks to keep peak memory O(seq_len × ATTN_CHUNK_SIZE).
+    # State maintained across chunks (all shape (N_HEADS, seq_len)):
+    q_pos       = jnp.arange(seq_len)
+    running_max = jnp.full((N_HEADS, seq_len), -jnp.inf, dtype=COMPUTE_DTYPE)
+    running_sum = jnp.zeros((N_HEADS, seq_len),           dtype=COMPUTE_DTYPE)
+    running_out = jnp.zeros((N_HEADS, seq_len, d_head),   dtype=COMPUTE_DTYPE)
 
-    Q = x @ params['W_q']             # (seq_len, D_MODEL) @ (D_MODEL, D_MODEL) → (seq_len, D_MODEL)
-    K = x @ params['W_k']             # Same shape. Every token now has a query, key, and value vector.
-    V = x @ params['W_v']             # Same shape.
+    n_chunks = (seq_len + ATTN_CHUNK_SIZE - 1) // ATTN_CHUNK_SIZE
+    for i in range(n_chunks):
+        cs = i * ATTN_CHUNK_SIZE
+        ce = min(cs + ATTN_CHUNK_SIZE, seq_len)
 
-    # --- Step 2: Split into heads ---
-    # Reshape from (seq_len, D_MODEL) to (seq_len, N_HEADS, d_head),
-    # then transpose to (N_HEADS, seq_len, d_head) so each head is a separate batch.
+        K_c = K[:, cs:ce, :]  # (N_HEADS, chunk_size, d_head)
+        V_c = V[:, cs:ce, :]
 
-    Q = Q.reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
-    # .reshape splits the D_MODEL dimension into N_HEADS groups of d_head each.
-    # .transpose(1,0,2) reorders axes: (seq_len, N_HEADS, d_head) → (N_HEADS, seq_len, d_head)
-    # Now Q[0] is head 0's queries for all tokens, Q[1] is head 1's, etc.
+        # Scores for this chunk: Q @ K_chunk^T / sqrt(d_head)
+        # Shape: (N_HEADS, seq_len, chunk_size)
+        scores = jnp.matmul(Q, K_c.transpose(0, 2, 1)) / scale
 
-    K = K.reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)  # Same reshaping for keys.
-    V = V.reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)  # Same reshaping for values.
+        # Causal mask: query at position i may attend to key at position j only if j ≤ i.
+        # k_pos are the absolute positions of keys in this chunk [cs, ce).
+        k_pos  = jnp.arange(cs, ce)
+        causal = jnp.where(
+            q_pos[:, None] >= k_pos[None, :],  # (seq_len, chunk_size)
+            jnp.zeros((), dtype=COMPUTE_DTYPE),
+            jnp.full((), -jnp.inf, dtype=COMPUTE_DTYPE),
+        )
+        scores = scores + causal[None, :, :]  # broadcast over N_HEADS
 
-    # --- Step 3: Scaled dot-product attention (the core formula) ---
+        # Online softmax update — rescale running state before adding new chunk.
+        chunk_max   = scores.max(axis=-1)                          # (N_HEADS, seq_len)
+        new_max     = jnp.maximum(running_max, chunk_max)
+        old_rescale = jnp.exp(running_max - new_max)              # (N_HEADS, seq_len)
+        chunk_exp   = jnp.exp(scores - new_max[:, :, None])       # (N_HEADS, seq_len, chunk_size)
 
-    scores = jnp.matmul(Q, K.transpose(0, 2, 1))
-    # Q shape:             (N_HEADS, seq_len, d_head)
-    # K.transpose(0,2,1):  (N_HEADS, d_head, seq_len)
-    # Result scores shape: (N_HEADS, seq_len, seq_len)
+        running_sum = running_sum * old_rescale + chunk_exp.sum(axis=-1)
+        running_out = running_out * old_rescale[:, :, None] + jnp.matmul(chunk_exp, V_c)
+        running_max = new_max
 
-    scores = scores / jnp.sqrt(d_head).astype(scores.dtype)
-    scores = scores + mask
-
-    weights = jax.nn.softmax(scores, axis=-1)
-
-    # --- Step 4: Weighted sum of values ---
-
-    out = jnp.matmul(weights, V)
-    # out: (N_HEADS, seq_len, d_head)
-
-    # --- Step 5: Concatenate heads and project ---
-
+    # --- Step 3: Normalise, concatenate heads, and project ---
+    out = running_out / running_sum[:, :, None]   # (N_HEADS, seq_len, d_head)
     out = out.transpose(1, 0, 2).reshape(seq_len, D_MODEL)
-    # .transpose(1,0,2): (N_HEADS, seq_len, d_head) → (seq_len, N_HEADS, d_head)
-    # .reshape: merge the last two dims back together → (seq_len, D_MODEL)
-    # This is the "concatenate heads" step — we're just undoing the split from Step 2.
-
-    out = out @ params['W_o']
-    # Final linear projection: (seq_len, D_MODEL) @ (D_MODEL, D_MODEL) → (seq_len, D_MODEL)
-    # This mixes information across heads and allows the model to learn which
-    # combinations of head outputs are useful.
-
-    return out  # Shape: (seq_len, D_MODEL) — same shape as the input x.
+    return out @ params['W_o']
 
 
 # ---------------------------------------------------------------------------
@@ -354,36 +348,16 @@ def init_block(key):
     }
 
 
-def block_forward(params, x, mask):
+def block_forward(params, x):
     """
     Runs one full transformer block on input x.
 
-    x:    shape (seq_len, D_MODEL)
-    mask: causal mask shape (seq_len, seq_len)
+    x: shape (seq_len, D_MODEL)
     Returns same shape as x.
     """
-
-    # --- Sublayer 1: Multi-head self-attention ---
-
-    x = x + attention_forward(params['attn'], layer_norm(params['ln1'], x), mask)
-    # Breaking this down right to left:
-    #   1. layer_norm(params['ln1'], x)          — normalize x before attention
-    #   2. attention_forward(..., normalized_x)  — run attention on the normalized input
-    #   3. x + (result)                          — residual connection: add original x back
-    #
-    # The residual connection is critical. Without it, in a 4-layer model gradients
-    # would have to flow back through 4 chained multiplications and would shrink to
-    # near-zero (vanishing gradients). The shortcut gives gradients a direct path back.
-
-    # --- Sublayer 2: Feed-forward network ---
-
+    x = x + attention_forward(params['attn'], layer_norm(params['ln1'], x))
     x = x + ffn_forward(params['ffn'], layer_norm(params['ln2'], x))
-    # Same pattern:
-    #   1. layer_norm(params['ln2'], x)  — normalize (x now includes the attention update)
-    #   2. ffn_forward(..., normalized)  — run FFN on normalized input
-    #   3. x + (result)                 — residual connection again
-
-    return x  # Shape: (seq_len, D_MODEL)
+    return x
 
 
 # ---------------------------------------------------------------------------
@@ -434,10 +408,8 @@ def model_forward_features(params, token_ids):
         params,
     )
     x = embed(bf16_params['embeddings'], token_ids)
-    seq_len = token_ids.shape[0]
-    mask = make_causal_mask(seq_len).astype(COMPUTE_DTYPE)
     for block_params in bf16_params['blocks']:
-        x = block_forward(block_params, x, mask)
+        x = block_forward(block_params, x)
     # Cast back to float32 for the final layer norm and loss computation.
     return layer_norm(params['ln_final'], x.astype(jnp.float32))
 
