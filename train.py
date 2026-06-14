@@ -16,6 +16,7 @@ from datasets import load_dataset
 import tiktoken
 
 from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL
+from attention import print_attention_config
 
 # ---------------------------------------------------------------------------
 # CHECKPOINTING
@@ -251,8 +252,8 @@ def make_train_step(optimizer):
 # genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 64  # bfloat16 + chunked attention halve activation memory vs bs=32.
-CHECKPOINT_EVERY = 500
+BATCH_SIZE = 32
+CHECKPOINT_EVERY = 1000
 
 # ---------------------------------------------------------------------------
 # DATASET REGISTRY
@@ -396,17 +397,34 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
 
     loader = StreamingLoader(dataset_cfg, seq_len, batch_size)
     print(f"Training on {dataset}, batch_size={batch_size}, seq_len={seq_len}")
+    print_attention_config()
     print(f"Running for {n_steps} steps...\n")
 
+    import time as _time
+
     loss = None
+    step_times = []
     for step in range(n_steps):
+        t_start = _time.time()
+
+        t0 = _time.time()
         batch = loader.get_batch()
+        t_data = _time.time() - t0
+
+        t0 = _time.time()
         params, opt_state, loss = train_step(params, opt_state, batch)
+        jax.block_until_ready(loss)  # ensure GPU work is done before timing
+        t_train = _time.time() - t0
 
-        wandb.log({"loss": float(loss), "step": step})
+        t_step = _time.time() - t_start
 
-        if step % 100 == 0:
-            print(f"Step {step:>4}  loss: {loss:.4f}")
+        step_times.append(t_step)
+        wandb.log({"loss": float(loss), "step": step,
+                   "step_time": t_step, "data_time": t_data, "train_time": t_train})
+
+        if step % 100 == 0 or step < 5:
+            print(f"Step {step:>4}  loss: {loss:.4f}  "
+                  f"step: {t_step:.2f}s (data: {t_data:.3f}s  train: {t_train:.2f}s)")
 
         if step > 0 and step % CHECKPOINT_EVERY == 0:
             save_checkpoint(params, step, run_name=run_name)
@@ -419,7 +437,9 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
 
     # --- Save final checkpoint ---
     final_path = save_checkpoint(params, n_steps, run_name=run_name)
-    print(f"\nTraining complete. Final loss: {loss:.4f}\n")
+    avg_step = sum(step_times[1:]) / max(len(step_times) - 1, 1)  # exclude JIT step
+    print(f"\nTraining complete. Final loss: {loss:.4f}")
+    print(f"Avg step time: {avg_step:.2f}s (excluding first step JIT)\n")
 
     # --- Generate a sample ---
     enc = tiktoken.get_encoding("gpt2")

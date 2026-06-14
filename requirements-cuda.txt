@@ -1,0 +1,7 @@
+jax>=0.4.31
+jaxlib>=0.4.31
+optax>=0.1.9
+wandb
+datasets
+tiktoken
+numpy

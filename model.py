@@ -2,6 +2,8 @@ import jax                          # Core JAX library: handles autodiff, JIT co
 import jax.numpy as jnp              # JAX's version of NumPy — same API but runs on GPU/TPU and supports autodiff
 from jax import random               # JAX's random number module (different from Python's random — must pass keys explicitly)
 
+from attention import attention      # Cross-platform attention dispatch (see attention.py)
+
 # ---------------------------------------------------------------------------
 # HYPERPARAMETERS
 # These are the knobs that define the size and shape of the model.
@@ -17,9 +19,6 @@ N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
 MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
 
 COMPUTE_DTYPE    = jnp.bfloat16  # Forward-pass dtype; stored params stay float32.
-ATTN_CHUNK_SIZE  = 256           # K/V positions processed per chunk in attention.
-                                  # Peak attention memory: O(seq_len × ATTN_CHUNK_SIZE)
-                                  # instead of O(seq_len²). Enables long context.
 
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS
@@ -78,27 +77,17 @@ def embed(params, token_ids):
 
 
 # ---------------------------------------------------------------------------
-# SECTION 2: MULTI-HEAD CHUNKED ATTENTION
+# SECTION 2: MULTI-HEAD ATTENTION
 #
 # Attention lets every token "look at" other tokens and borrow from them.
 # Causal masking enforces the decoder rule: token i can only attend to
 # positions 0..i (no peeking at future tokens).
 #
-# Standard attention materialises the full (N_HEADS, seq_len, seq_len)
-# score matrix. At seq_len=2048 that is 8×2048×2048×2 bytes = 64 MB per
-# sequence — the main obstacle to longer context.
-#
-# Chunked (memory-efficient) attention processes K/V in ATTN_CHUNK_SIZE
-# blocks and accumulates the result with an online softmax, keeping peak
-# memory at O(seq_len × ATTN_CHUNK_SIZE) regardless of total seq_len.
-#
-# Online softmax algorithm (Milakov & Gimelshein 2018):
-#   For each K/V chunk:
-#     1. Compute chunk scores = Q @ K_chunk^T / sqrt(d_head)
-#     2. Apply causal mask for this chunk's key positions
-#     3. Update running max; rescale old running sum and output
-#     4. Accumulate exp(scores) sum and exp(scores) @ V_chunk
-#   Final output = running_out / running_sum
+# The actual attention computation (scores, mask, softmax, weighted sum)
+# is delegated to attention.py which dispatches to the best implementation
+# for the current platform:
+#   - CUDA: cuDNN flash attention (fused kernel, no seq² memory)
+#   - Metal/CPU: standard matmul (single fused XLA kernel)
 # ---------------------------------------------------------------------------
 
 
@@ -152,18 +141,7 @@ def attention_forward(params, x):
     V = (x @ params['W_v']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
     # All: (N_HEADS, seq_len, d_head)
 
-    scale  = jnp.sqrt(jnp.array(d_head, dtype=x.dtype))
-    scores = jnp.matmul(Q, K.transpose(0, 2, 1)) / scale
-    # (N_HEADS, seq_len, seq_len) — causal mask applied via triu of -inf
-
-    q_pos  = jnp.arange(seq_len)
-    mask   = jnp.where(q_pos[:, None] >= q_pos[None, :],
-                       jnp.zeros((), dtype=x.dtype),
-                       jnp.full((), -jnp.inf, dtype=x.dtype))
-    scores = scores + mask[None, :, :]
-
-    weights = jax.nn.softmax(scores, axis=-1)
-    out     = jnp.matmul(weights, V)                       # (N_HEADS, seq_len, d_head)
+    out     = attention(Q, K, V)                            # (N_HEADS, seq_len, d_head)
     out     = out.transpose(1, 0, 2).reshape(seq_len, D_MODEL)
     return out @ params['W_o']
 
