@@ -357,7 +357,7 @@ def model_forward_features(params, token_ids):
     )
     x = embed(bf16_params['embeddings'], token_ids)
     for block_params in bf16_params['blocks']:
-        x = block_forward(block_params, x)
+        x = jax.checkpoint(block_forward, prevent_cse=False)(block_params, x)
     # Cast back to float32 for the final layer norm and loss computation.
     return layer_norm(params['ln_final'], x.astype(jnp.float32))
 

@@ -17,6 +17,7 @@ import tiktoken
 
 from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL
 from attention import print_attention_config
+from logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
 
 # ---------------------------------------------------------------------------
 # CHECKPOINTING
@@ -228,6 +229,9 @@ loss_and_grad_fn = jax.value_and_grad(batch_loss)
 # Same as before, but now differentiating through the batched loss.
 # Gradients are automatically averaged across the batch because we used jnp.mean().
 
+eval_batch_loss = jax.jit(batch_loss)
+# JIT-compiled loss without gradients — used for validation evaluation.
+
 
 def make_train_step(optimizer):
     """Returns a JIT-compiled train step closed over the given optimizer."""
@@ -247,9 +251,9 @@ def make_train_step(optimizer):
 # ---------------------------------------------------------------------------
 # SECTION 4: TRAINING DATA
 #
-# We load TinyShakespeare — ~1.1M characters of Shakespeare plays.
-# This is large enough that the model cannot memorize it, so it must learn
-# genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
+# Sequential data consumption with validation split.
+# Each token is seen exactly once (single-epoch streaming).
+# A small held-out validation set is reserved at startup.
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 32
@@ -281,32 +285,50 @@ DATASETS = {
 # STREAMING DATA LOADER
 #
 # Streams documents from HuggingFace, tokenizes with tiktoken (Rust, ~100x
-# faster than pure-Python BPE), and fills a rolling token buffer in a
-# background thread so the GPU never waits for data.
+# faster than pure-Python BPE), and feeds tokens sequentially so the model
+# sees fresh data every step (no repetition within an epoch).
 #
-# Buffer design:
+# Design:
 #   - Background thread: streams docs → tokenizes → puts 500k-token chunks
 #     into a queue (up to PREFETCH chunks buffered ahead).
-#   - Main thread: randomly samples batches from the buffer.
-#     When the buffer drops below half, it tops up from the queue.
+#   - Main thread: consumes tokens sequentially from the buffer.
+#     Each get_batch() advances a cursor and returns the next contiguous
+#     block of batch_size × (seq_len+1) tokens, reshaped into a batch.
+#     When the cursor nears the end, old tokens are discarded and fresh
+#     chunks are pulled from the queue.
+#
+# Validation:
+#   - A small held-out set is reserved at init (VAL_TOKENS tokens).
+#   - val_loss() evaluates on fixed validation batches without gradients.
 # ---------------------------------------------------------------------------
 
-CHUNK_SIZE = 500_000   # tokens per background chunk
-PREFETCH   = 4         # chunks to buffer ahead of training
+CHUNK_SIZE  = 500_000   # tokens per background chunk
+PREFETCH    = 4         # chunks to buffer ahead of training
+VAL_TOKENS  = 100_000   # tokens reserved for validation (~200 pages of text)
+VAL_EVERY   = 100       # evaluate validation loss every N steps
 
 class StreamingLoader:
     def __init__(self, dataset_cfg, seq_len, batch_size):
         self.seq_len    = seq_len
         self.batch_size = batch_size
+        self._stride    = batch_size * (seq_len + 1)
+        self._cursor    = 0
         self._q         = queue_mod.Queue(maxsize=PREFETCH)
         self._buf       = np.array([], dtype=np.int32)
+        self._val_data  = None
 
         t = threading.Thread(target=self._producer, args=(dataset_cfg,), daemon=True)
         t.start()
 
-        print("Prefilling token buffer...")
-        self._refill()
-        print(f"Buffer ready: {len(self._buf):,} tokens")
+        # Reserve validation data from the first tokens in the stream.
+        print("Reserving validation data...")
+        while len(self._buf) < VAL_TOKENS + CHUNK_SIZE * 2:
+            self._buf = np.concatenate([self._buf, self._q.get()])
+        self._val_data = self._buf[:VAL_TOKENS].copy()
+        self._buf = self._buf[VAL_TOKENS:]  # training data starts after val
+        self._cursor = 0
+        print(f"Validation: {len(self._val_data):,} tokens")
+        print(f"Train buffer: {len(self._buf):,} tokens")
 
     def _producer(self, cfg):
         """Background thread: stream → tokenize → enqueue chunks."""
@@ -325,20 +347,34 @@ class StreamingLoader:
                 self._q.put(np.array(chunk[:CHUNK_SIZE], dtype=np.int32))
                 chunk = chunk[CHUNK_SIZE:]
 
-    def _refill(self):
-        """Block until buffer holds at least CHUNK_SIZE * 2 tokens."""
-        while len(self._buf) < CHUNK_SIZE * 2:
-            self._buf = np.concatenate([self._buf, self._q.get()])
+    def _ensure_tokens(self, n):
+        """Ensure at least n tokens are available ahead of cursor."""
+        while len(self._buf) - self._cursor < n:
+            try:
+                new_chunk = self._q.get(timeout=30)
+            except queue_mod.Empty:
+                break
+            self._buf = np.concatenate([self._buf, new_chunk])
+        # Compact: discard consumed tokens to avoid unbounded memory growth.
+        if self._cursor > CHUNK_SIZE:
+            self._buf = self._buf[self._cursor:]
+            self._cursor = 0
 
     def get_batch(self):
-        """Return a random batch of shape (batch_size, seq_len+1)."""
-        min_tokens = self.batch_size * (self.seq_len + 1) * 4
-        if len(self._buf) < min_tokens:
-            self._refill()
-        n      = len(self._buf)
-        starts = np.random.randint(0, n - self.seq_len - 1, size=(self.batch_size,))
-        idx    = starts[:, None] + np.arange(self.seq_len + 1)[None, :]
-        return jnp.array(self._buf[idx], dtype=jnp.int32)
+        """Return the next sequential batch of shape (batch_size, seq_len+1)."""
+        self._ensure_tokens(self._stride)
+        end = self._cursor + self._stride
+        flat = self._buf[self._cursor:end]
+        self._cursor = end
+        return jnp.array(flat.reshape(self.batch_size, self.seq_len + 1), dtype=jnp.int32)
+
+    def val_batches(self):
+        """Yield all non-overlapping validation batches."""
+        n = len(self._val_data) // (self.seq_len + 1) // self.batch_size
+        for i in range(n):
+            start = i * self._stride
+            flat  = self._val_data[start:start + self._stride]
+            yield jnp.array(flat.reshape(self.batch_size, self.seq_len + 1), dtype=jnp.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -396,35 +432,32 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     signal.signal(signal.SIGTERM, _handle_signal)
 
     loader = StreamingLoader(dataset_cfg, seq_len, batch_size)
+    n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"Training on {dataset}, batch_size={batch_size}, seq_len={seq_len}")
+    print(f"Model parameters: {n_params:,}")
     print_attention_config()
     print(f"Running for {n_steps} steps...\n")
 
-    import time as _time
+    hw_peak_tflops = benchmark_peak_tflops()
+    print(f"Hardware peak: {hw_peak_tflops:.1f} TFLOPS (bf16)")
+    logger = TrainingLogger(
+        eval_batch_loss, loader.val_batches, val_every=VAL_EVERY,
+        n_params=n_params, seq_len=seq_len, batch_size=batch_size,
+        hw_peak_tflops=hw_peak_tflops,
+    )
+    timer = StepTimer()
 
     loss = None
-    step_times = []
     for step in range(n_steps):
-        t_start = _time.time()
-
-        t0 = _time.time()
+        timer.start()
         batch = loader.get_batch()
-        t_data = _time.time() - t0
+        timer.mark_data()
 
-        t0 = _time.time()
         params, opt_state, loss = train_step(params, opt_state, batch)
-        jax.block_until_ready(loss)  # ensure GPU work is done before timing
-        t_train = _time.time() - t0
+        jax.block_until_ready(loss)
+        timer.mark_train()
 
-        t_step = _time.time() - t_start
-
-        step_times.append(t_step)
-        wandb.log({"loss": float(loss), "step": step,
-                   "step_time": t_step, "data_time": t_data, "train_time": t_train})
-
-        if step % 100 == 0 or step < 5:
-            print(f"Step {step:>4}  loss: {loss:.4f}  "
-                  f"step: {t_step:.2f}s (data: {t_data:.3f}s  train: {t_train:.2f}s)")
+        logger.log_step(step, loss, timer, params, n_steps)
 
         if step > 0 and step % CHECKPOINT_EVERY == 0:
             save_checkpoint(params, step, run_name=run_name)
@@ -437,9 +470,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
 
     # --- Save final checkpoint ---
     final_path = save_checkpoint(params, n_steps, run_name=run_name)
-    avg_step = sum(step_times[1:]) / max(len(step_times) - 1, 1)  # exclude JIT step
-    print(f"\nTraining complete. Final loss: {loss:.4f}")
-    print(f"Avg step time: {avg_step:.2f}s (excluding first step JIT)\n")
+    logger.print_summary(loss)
 
     # --- Generate a sample ---
     enc = tiktoken.get_encoding("gpt2")
