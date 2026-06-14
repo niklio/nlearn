@@ -251,7 +251,7 @@ def make_train_step(optimizer):
 # genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 32  # bfloat16 forward pass halves activation memory; try 64 if stable.
+BATCH_SIZE = 64  # bfloat16 + chunked attention halve activation memory vs bs=32.
 CHECKPOINT_EVERY = 500
 
 # ---------------------------------------------------------------------------
