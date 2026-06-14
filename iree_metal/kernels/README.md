@@ -9,9 +9,43 @@ motivated the whole IREE migration.
 
 | Piece | State |
 |---|---|
-| Forward kernel (`flash_attention.metal`) | ✅ authored; compiles to AIR + metallib (`xcrun metal`); online-softmax recurrence verified vs standard causal attention (max abs diff 1.2e-7) |
-| Binding into JAX→IREE→Metal | ⏳ designed, not yet implemented (the hard part — see below) |
-| Backward pass (dQ/dK/dV) | ⏳ deferred until forward binds end-to-end |
+| Forward kernel (`flash_attention.metal`) | ✅ authored; compiles to AIR + metallib (`xcrun metal`); online-softmax recurrence verified vs standard causal attention (max abs diff 1.2e-7). NB: written with simple `[[buffer(N)]]` params — must be rewritten to the argument-buffer ABI below before it can bind. |
+| Compiler: Metal external-object support | ✅ patched (`patches/04`): `MetalSPIRVTarget::serializeExternalExecutable` embeds a provided MSL object into the metal flatbuffer (Metal had no external path; Vulkan did). Compiler rebuilt clean. |
+| Metal dispatch ABI | ✅ reverse-engineered (see below + `abi_reference/`) |
+| Hand-MLIR trivial dispatch on Metal (iree-run-module) | ⏳ next: prove the external path end-to-end |
+| Frontend: `stablehlo.custom_call` → `flow.dispatch` | ⏳ patch `StableHLOCustomCalls.cpp` so JAX can invoke it |
+| `jax.ffi` wiring in `attention.py` | ⏳ |
+| Backward pass (dQ/dK/dV) + custom_vjp | ⏳ deferred until forward binds end-to-end |
+
+## The Metal dispatch ABI (reverse-engineered)
+
+IREE compiles normal kernels with spirv-cross `argument_buffers = true`. A
+conforming kernel (see `abi_reference/generated_mul.msl`, dumped from a real
+`iree-compile --iree-metal-compile-to-metallib=false` of an elementwise mul) has
+this shape — a hand-authored kernel must match it:
+
+```metal
+struct spvDescriptorSetBuffer0 {
+    device T* _resource_var_0_0_ [[id(0)]];   // binding 0
+    device T* _resource_var_0_1_ [[id(1)]];   // binding 1
+    device T* _resource_var_0_2_ [[id(2)]];   // binding 2 ...
+};
+kernel void name(constant spvDescriptorSetBuffer0& set0 [[buffer(0)]],
+                 uint3 wgid [[threadgroup_position_in_grid]],
+                 uint3 lid  [[thread_position_in_threadgroup]]) {
+    uint gid = lid.x + wgid.x * THREADGROUP_SIZE_X;   // global id
+    ...
+}
+```
+
+- Storage-buffer bindings arrive in a **Metal argument buffer** at `[[buffer(0)]]`,
+  each binding at `[[id(n)]]`. NOT individual `[[buffer(n)]]` params.
+- Push constants (if any) go at buffer index
+  `IREE_HAL_METAL_MAX_DESCRIPTOR_SET_COUNT - 1` (the
+  `IREE_HAL_METAL_PUSH_CONSTANT_BUFFER_INDEX`).
+- Threadgroup (local) size comes from the export's `workgroup_size` attr
+  (patch 04 reads it; default 64,1,1); the host `count()` region gives the
+  number of threadgroups.
 
 ## The kernel
 
