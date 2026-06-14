@@ -15,7 +15,7 @@ from datasets import load_dataset
 
 import tiktoken
 
-from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL
+from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
 from attention import print_attention_config
 from logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
 
@@ -468,8 +468,14 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     print_attention_config()
     print(f"Running for {n_steps} steps...\n")
 
-    hw_peak_tflops = benchmark_peak_tflops()
-    print(f"Hardware peak: {hw_peak_tflops:.1f} TFLOPS (bf16)")
+    # Benchmark in the model's compute dtype (bf16 isn't supported on the
+    # IREE metal-spirv target). Non-fatal: it's only used for MFU logging.
+    try:
+        hw_peak_tflops = benchmark_peak_tflops(dtype=COMPUTE_DTYPE)
+        print(f"Hardware peak: {hw_peak_tflops:.1f} TFLOPS ({COMPUTE_DTYPE.__name__})")
+    except Exception as e:
+        hw_peak_tflops = 0.0
+        print(f"Hardware peak benchmark skipped ({type(e).__name__}).")
     logger = TrainingLogger(
         eval_batch_loss, loader.val_batches, val_every=VAL_EVERY,
         n_params=n_params, seq_len=seq_len, batch_size=batch_size,
