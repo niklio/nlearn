@@ -179,11 +179,23 @@ def latest_job_id(conf):
 
 
 def status_str(raw):
-    """Normalise pueue status which can be a string or e.g. {'Failed': 1}."""
+    """Normalise pueue status: string, {'Failed': 1}, or {'Done': {timing...}}."""
+    if isinstance(raw, str):
+        return raw
     if isinstance(raw, dict):
-        key  = next(iter(raw))
-        code = raw[key]
-        return f"{key} ({code})"
+        key = next(iter(raw))
+        val = raw[key]
+        if isinstance(val, int):
+            return f"{key} ({val})"
+        if isinstance(val, dict):
+            # Newer pueue: status is {'Running': {timing}, 'Done': {timing, result}, ...}
+            result = val.get("result")
+            if result is not None:
+                if isinstance(result, dict):
+                    exit_key = next(iter(result))
+                    return f"{exit_key} ({result[exit_key]})"
+                return str(result)
+            return key
     return str(raw)
 
 
@@ -205,7 +217,13 @@ def format_jobs(tasks):
         raw    = t.get("status", "?")
         st     = status_str(raw)
         color  = STATUS_COLORS.get(st.split()[0], RED)
-        start  = (t.get("start") or "")[:16].replace("T", " ") or "-"
+        # Start time may be top-level or nested inside the status dict (newer pueue).
+        start = t.get("start") or ""
+        if not start and isinstance(raw, dict):
+            timing = next(iter(raw.values()))
+            if isinstance(timing, dict):
+                start = timing.get("start", "")
+        start  = (start or "")[:16].replace("T", " ") or "-"
         label  = (t.get("label") or "(unlabelled)")[:42]
         lines.append(f"  {t['id']:>4}  {color}{st:<14}{RESET}  {label:<42}  {start}")
     return "\n".join(lines)

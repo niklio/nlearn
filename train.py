@@ -251,7 +251,7 @@ def make_train_step(optimizer):
 # genuine patterns: spelling, punctuation, dramatic dialogue structure, etc.
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 32  # Metal GPU memory limit: attention activations cap us at ~bs=32
+BATCH_SIZE = 32  # bfloat16 forward pass halves activation memory; try 64 if stable.
 CHECKPOINT_EVERY = 500
 
 # ---------------------------------------------------------------------------

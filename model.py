@@ -16,6 +16,8 @@ D_FF        = 2048     # Hidden size of the feed-forward sublayer. Kept at 4 * D
 N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
 MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
 
+COMPUTE_DTYPE = jnp.bfloat16  # Forward-pass dtype; stored params stay float32.
+
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS
 #
@@ -174,35 +176,18 @@ def attention_forward(params, x, mask):
 
     scores = jnp.matmul(Q, K.transpose(0, 2, 1))
     # Q shape:             (N_HEADS, seq_len, d_head)
-    # K.transpose(0,2,1):  (N_HEADS, d_head, seq_len)  ← swap last two axes to make K^T
+    # K.transpose(0,2,1):  (N_HEADS, d_head, seq_len)
     # Result scores shape: (N_HEADS, seq_len, seq_len)
-    # scores[h, i, j] = dot product of token i's query with token j's key, for head h.
-    # High score = token i wants to attend to token j.
 
-    scores = scores / jnp.sqrt(d_head)
-    # Divide by sqrt(d_head) = sqrt(32) ≈ 5.66.
-    # Without this, dot products grow large as d_head increases, pushing softmax into
-    # regions with near-zero gradients (the "vanishing gradient" problem). This keeps
-    # the scores in a well-behaved range. This is the "scaled" in "scaled dot-product attention".
-
+    scores = scores / jnp.sqrt(d_head).astype(scores.dtype)
     scores = scores + mask
-    # Add the causal mask. Positions where mask = -inf become -inf in scores.
-    # mask shape (seq_len, seq_len) broadcasts across the N_HEADS dimension automatically.
 
     weights = jax.nn.softmax(scores, axis=-1)
-    # Softmax over the last axis (the "which token to attend to" axis).
-    # Turns raw scores into probabilities that sum to 1 across each row.
-    # -inf entries become exactly 0 — future tokens are completely ignored.
-    # weights[h, i, j] = "how much does token i attend to token j, in head h?"
 
     # --- Step 4: Weighted sum of values ---
 
     out = jnp.matmul(weights, V)
-    # weights: (N_HEADS, seq_len, seq_len)
-    # V:       (N_HEADS, seq_len, d_head)
-    # out:     (N_HEADS, seq_len, d_head)
-    # For each token i, this computes a weighted average of all value vectors,
-    # where the weights come from the attention distribution we just computed.
+    # out: (N_HEADS, seq_len, d_head)
 
     # --- Step 5: Concatenate heads and project ---
 
@@ -441,12 +426,20 @@ def model_forward_features(params, token_ids):
     token_ids: 1D integer array of shape (seq_len,)
     Returns:   2D float array of shape (seq_len, D_MODEL)
     """
-    x = embed(params['embeddings'], token_ids)
+    # Cast params to COMPUTE_DTYPE (bfloat16) for all matmuls; stored params stay float32.
+    # JAX autodiff handles the astype gradient correctly: bf16 grads get upcast to f32
+    # when they reach the stored float32 params.
+    bf16_params = jax.tree_util.tree_map(
+        lambda p: p.astype(COMPUTE_DTYPE) if jnp.issubdtype(p.dtype, jnp.floating) else p,
+        params,
+    )
+    x = embed(bf16_params['embeddings'], token_ids)
     seq_len = token_ids.shape[0]
-    mask = make_causal_mask(seq_len)
-    for block_params in params['blocks']:
+    mask = make_causal_mask(seq_len).astype(COMPUTE_DTYPE)
+    for block_params in bf16_params['blocks']:
         x = block_forward(block_params, x, mask)
-    return layer_norm(params['ln_final'], x)
+    # Cast back to float32 for the final layer norm and loss computation.
+    return layer_norm(params['ln_final'], x.astype(jnp.float32))
 
 
 def model_forward(params, token_ids):
