@@ -9,7 +9,8 @@ motivated the whole IREE migration.
 
 | Piece | State |
 |---|---|
-| Forward kernel (`flash_attention.metal`) | ✅ authored; compiles to AIR + metallib (`xcrun metal`); online-softmax recurrence verified vs standard causal attention (max abs diff 1.2e-7). NB: written with simple `[[buffer(N)]]` params — must be rewritten to the argument-buffer ABI below before it can bind. |
+| Forward kernel (`flash_attention.metal`) | ✅ ABI-conforming; emits `O` and `L` (logsumexp); runs on M3 GPU via IREE, matches reference 2.4e-7 |
+| **True backward kernels** (`flash_attention_bwd_dq`, `flash_attention_bwd_dkdv`) | ✅ O(seq)-memory dQ/dK/dV (recompute softmax from `L`, no seq²); validated on M3 GPU vs NumPy reference — dQ 3.6e-7, dK 9.5e-7, dV 3.9e-7 (`test/flash_bwd_test.mlir`, `test/validate_flash_bwd.py`) |
 | Compiler: Metal external-object support | ✅ patched (`patches/04`): `MetalSPIRVTarget::serializeExternalExecutable` embeds a provided MSL object into the metal flatbuffer (Metal had no external path; Vulkan did). Compiler rebuilt clean. |
 | Metal dispatch ABI | ✅ reverse-engineered (see below + `abi_reference/`) |
 | Hand-MLIR trivial dispatch on Metal (iree-run-module) | ✅ `test/spike.mlir` + `spike_mul.metal`: out=2*4=8 on the M3 GPU |
