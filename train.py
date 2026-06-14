@@ -15,7 +15,7 @@ from datasets import load_dataset
 
 import tiktoken
 
-from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL
+from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
 from attention import print_attention_config
 from logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
 
@@ -135,8 +135,8 @@ def cross_entropy_loss(params, token_ids):
 
     for i in range(_N_CHUNKS):
         chunk_start  = i * VOCAB_CHUNK_SIZE
-        chunk_logits = x @ W_chunks[i]                     # (seq_len, VOCAB_CHUNK_SIZE)
-        chunk_logits = jnp.where(_VOCAB_MASK[i], chunk_logits, -jnp.inf)
+        raw_logits   = x @ W_chunks[i]                     # (seq_len, VOCAB_CHUNK_SIZE)
+        chunk_logits = jnp.where(_VOCAB_MASK[i], raw_logits, -jnp.inf)
 
         chunk_max = chunk_logits.max(axis=-1)
         new_max   = jnp.maximum(running_max, chunk_max)
@@ -149,7 +149,14 @@ def cross_entropy_loss(params, token_ids):
 
         in_chunk      = (target_ids >= chunk_start) & (target_ids < chunk_start + VOCAB_CHUNK_SIZE)
         safe_idx      = jnp.clip(target_ids - chunk_start, 0, VOCAB_CHUNK_SIZE - 1)
-        chunk_correct = chunk_logits[jnp.arange(seq_len), safe_idx]
+        # Select the target token's logit via one-hot multiply rather than
+        # advanced indexing (chunk_logits[arange, safe_idx]). The gather's
+        # backward is a scatter, which IREE's metal-spirv path miscompiles under
+        # vmap (malformed tensor.expand_shape). One-hot select has a pure
+        # broadcast/reduce backward that lowers cleanly, at the cost of an extra
+        # (seq_len, VOCAB_CHUNK_SIZE) tensor we already materialise anyway.
+        onehot        = jax.nn.one_hot(safe_idx, VOCAB_CHUNK_SIZE, dtype=raw_logits.dtype)
+        chunk_correct = jnp.sum(raw_logits * onehot, axis=-1)  # raw (not -inf-masked) avoids 0*-inf=NaN
         correct_logit = jnp.where(in_chunk, chunk_correct, correct_logit)
 
     final_max, final_sum_exp = running_max, running_sum_exp
@@ -199,8 +206,29 @@ END_LR       = 1e-4    # End learning rate — decay to 10% of peak by the final
 #   4. Apply updates → nudge every parameter to reduce the loss
 # ---------------------------------------------------------------------------
 
-batched_loss_fn = jax.vmap(cross_entropy_loss, in_axes=(None, 0))
-# jax.vmap (vectorized map) transforms cross_entropy_loss so it runs on a whole
+def _simple_cross_entropy_loss(params, token_ids):
+    """Unchunked full-vocab cross-entropy. Used on the IREE-Metal backend, whose
+    metal-spirv compiler miscompiles the 13-chunk loop in cross_entropy_loss (a
+    fusion/codegen bug — every individual op is correct, but the composed loop
+    yields a wrong, eventually-negative loss). Materialises the (seq, VOCAB)
+    logit matrix, so it costs more memory than the chunked path. One-hot select
+    (not gather) avoids a scatter-under-vmap miscompile on the same backend."""
+    input_ids  = token_ids[:-1]
+    target_ids = token_ids[1:]
+    logits = model_forward(params, input_ids)               # (seq, VOCAB_SIZE)
+    log_Z  = jax.scipy.special.logsumexp(logits, axis=-1)
+    onehot = jax.nn.one_hot(target_ids, VOCAB_SIZE, dtype=logits.dtype)
+    correct_logit = jnp.sum(logits * onehot, axis=-1)
+    return -(correct_logit - log_Z).mean()
+
+
+import attention as _attn
+# Pick the loss for the active backend: chunked (memory-efficient) on CUDA/CPU,
+# simple full-vocab on IREE-Metal (the chunked one miscompiles there).
+_active_ce = _simple_cross_entropy_loss if _attn.USE_IREE_FLASH else cross_entropy_loss
+
+batched_loss_fn = jax.vmap(_active_ce, in_axes=(None, 0))
+# jax.vmap (vectorized map) transforms the loss so it runs on a whole
 # batch at once instead of one sequence at a time.
 # in_axes=(None, 0) means:
 #   - params (first arg): don't batch over this — share the same params across all sequences
@@ -420,7 +448,9 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
     key, model_key = random.split(key)
 
     print("Initializing model...")
-    params = init_model(model_key)
+    # jit the init: eager random.normal emits a Sharding custom_call that the
+    # IREE-Metal backend can't legalize; running it inside jit avoids that.
+    params = jax.jit(init_model)(model_key)
     opt_state = optimizer.init(params)
 
     # Graceful interrupt: set a flag in the signal handler, check it each step.
@@ -438,9 +468,14 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
     print_attention_config()
     print(f"Running for {steps} steps...\n")
 
-    hw_peak_tflops = benchmark_peak_tflops()
-    print(f"Hardware peak: {hw_peak_tflops:.1f} TFLOPS (bf16)")
-
+    # Benchmark in the model's compute dtype (bf16 isn't supported on the
+    # IREE metal-spirv target). Non-fatal: it's only used for MFU logging.
+    try:
+        hw_peak_tflops = benchmark_peak_tflops(dtype=COMPUTE_DTYPE)
+        print(f"Hardware peak: {hw_peak_tflops:.1f} TFLOPS ({COMPUTE_DTYPE.__name__})")
+    except Exception as e:
+        hw_peak_tflops = 0.0
+        print(f"Hardware peak benchmark skipped ({type(e).__name__}).")
     logger = TrainingLogger(
         eval_batch_loss, loader.val_batches, val_every=VAL_EVERY,
         n_params=n_params, seq_len=seq_len, batch_size=batch_size,

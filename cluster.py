@@ -83,6 +83,110 @@ def rssh_stream(conf, cmd):
     return proc.returncode
 
 
+# ---------------------------------------------------------------------------
+# IREE-Metal runtime
+#
+# Jobs run on the mini through the open-source IREE-Metal stack (native Metal
+# FlashAttention kernel) instead of the abandoned jax-metal. The mini needs an
+# isolated venv (JAX 0.6.1 + IREE) plus the prebuilt, patched compiler/plugin
+# dylibs. We SHIP those prebuilt artifacts from this build host and fall back to
+# building IREE from source on the mini only if shipping/loading fails.
+# ---------------------------------------------------------------------------
+
+VENV_PY      = "$HOME/.venvs/iree/bin/python"
+IREE_BUNDLE  = ".iree_runtime"          # under CLUSTER_DIR on the mini
+# Where the prebuilt dylibs live on THIS build host (override via .cluster.conf
+# IREE_BUILD_DIR=...). The plugin/compiler dylibs are build artifacts, not in git.
+DEFAULT_BUILD_DIR = str(Path.home() /
+    "src/iree/integrations/pjrt/python_packages/iree_metal_plugin/build/cmake")
+
+
+def iree_env_preamble(conf):
+    """Shell exports that point JAX at the shipped IREE-Metal stack. Uses $HOME
+    so the venv/lld paths resolve on the mini, and CLUSTER_DIR (absolute)."""
+    d = conf["CLUSTER_DIR"]
+    bundle = f"{d}/{IREE_BUNDLE}"
+    lld = ("$HOME/.venvs/iree/lib/python3.13/site-packages/iree/compiler/"
+           "_mlir_libs/iree-lld")
+    return "\n".join([
+        "export JAX_PLATFORMS=iree_metal",
+        f"export PYTHONPATH={bundle}:{d}:$PYTHONPATH",
+        f"export NLEARN_IREE_PLUGIN_DYLIB={bundle}/pjrt_plugin_iree_metal.dylib",
+        f"export IREE_PJRT_COMPILER_LIB_PATH={bundle}/libIREECompiler.dylib",
+        f"export NLEARN_FLASH_KERNEL_PATH={d}/iree_metal/kernels/flash_attention.metal",
+        # metal-compile-to-metallib=false: the mini has no `xcrun metal` tool, so
+        # embed MSL source and let the Metal runtime compile it. lld serializes
+        # the llvm-cpu host-helper executables the compiler emits.
+        f'export IREE_PJRT_IREE_COMPILER_OPTIONS="--iree-llvmcpu-embedded-linker-path={lld} --iree-metal-compile-to-metallib=false"',
+    ])
+
+
+def local_build_dir(conf):
+    return conf.get("IREE_BUILD_DIR") or DEFAULT_BUILD_DIR
+
+
+def ship_iree_bundle(conf):
+    """rsync the prebuilt patched compiler + plugin dylibs + standalone plugin
+    loader to the mini. Returns True if shipped, False if local dylibs missing."""
+    bd = Path(local_build_dir(conf))
+    compiler = bd / "iree_core/lib/libIREECompiler.dylib"
+    plugin = bd / "python/iree/_pjrt_libs/metal/pjrt_plugin_iree_metal.dylib"
+    if not compiler.exists() or not plugin.exists():
+        print(f"  Prebuilt dylibs not found under {bd} — will build on cluster.")
+        return False
+    stage = REPO_ROOT / "iree_metal" / "cluster"  # holds jax_plugins/
+    print("Shipping IREE-Metal runtime bundle (~275MB)...")
+    bundle = f"{conf['CLUSTER_DIR']}/{IREE_BUNDLE}"
+    rssh(conf, f"mkdir -p {bundle}")
+    subprocess.run(["rsync", "-az", str(compiler), str(plugin),
+                    f"{stage}/jax_plugins",
+                    f"{ssh_target(conf)}:{bundle}/"], check=True)
+    return True
+
+
+def iree_loads_ok(conf):
+    """Probe: does the shipped plugin load and enumerate the Metal device?"""
+    test = (f"{iree_env_preamble(conf)}\n"
+            f"cd {conf['CLUSTER_DIR']} && {VENV_PY} -c "
+            f"'import jax; assert jax.devices()[0].platform==\"iree_metal\"; print(\"IREE_OK\")'")
+    r = rssh(conf, test, check=False, capture=True)
+    return "IREE_OK" in (r.stdout or "")
+
+
+def build_iree_on_cluster(conf):
+    """Fallback: clone IREE on the mini, apply our patches, build the compiler
+    and metal plugin from source. Slow (multi-hour) but self-contained."""
+    print("Building IREE from source on the cluster (fallback; this is slow)...")
+    d = conf["CLUSTER_DIR"]
+    steps = " && ".join([
+        "export PATH=/opt/homebrew/bin:$PATH",
+        "brew install cmake ninja",
+        "mkdir -p ~/src && cd ~/src",
+        "(test -d iree/.git || git clone https://github.com/iree-org/iree.git)",
+        "cd iree && git fetch --depth 1 origin e4a3b0405d7d23554da26403658d0e8c3c5ecf25 && git checkout e4a3b0405d7d23554da26403658d0e8c3c5ecf25",
+        "git submodule update --init --depth 1 third_party/",
+        # apply the vendored patches + drop in the authored plugin files
+        f"for p in {d}/iree_metal/patches/*.patch; do git apply \"$p\" || true; done",
+        f"cp -R {d}/iree_metal/plugin/metal_backend integrations/pjrt/src/iree_pjrt/metal",
+        f"cp -R {d}/iree_metal/plugin/iree_metal_plugin integrations/pjrt/python_packages/iree_metal_plugin",
+        f"cp {d}/iree_metal/plugin/patch_protobuf_absl.sh integrations/pjrt/cmake/",
+        "cd integrations/pjrt",
+        "CMAKE_OSX_ARCHITECTURES=arm64 MACOSX_DEPLOYMENT_TARGET=13.0 uv pip install --python ~/.venvs/iree/bin/python --no-build-isolation --no-deps -v -e python_packages/iree_metal_plugin",
+        "cd python_packages/iree_metal_plugin/build/cmake && ninja libIREECompiler.dylib",
+    ])
+    rssh(conf, steps)
+    # Point the bundle at the freshly built dylibs.
+    built = "~/src/iree/integrations/pjrt/python_packages/iree_metal_plugin/build/cmake"
+    bundle = f"{d}/{IREE_BUNDLE}"
+    rssh(conf, f"mkdir -p {bundle} && "
+               f"cp {built}/iree_core/lib/libIREECompiler.dylib {bundle}/ && "
+               f"cp {built}/python/iree/_pjrt_libs/metal/pjrt_plugin_iree_metal.dylib {bundle}/ && "
+               f"cp -R {REPO_ROOT.name}/../{IREE_BUNDLE}/jax_plugins {bundle}/ 2>/dev/null || true")
+    # ensure the standalone loader is present
+    subprocess.run(["rsync", "-az", f"{REPO_ROOT}/iree_metal/cluster/jax_plugins",
+                    f"{ssh_target(conf)}:{bundle}/"], check=True)
+
+
 def sync_code(conf):
     print("Syncing code to cluster...")
     subprocess.run([
@@ -95,6 +199,7 @@ def sync_code(conf):
         "--exclude=*.pkl",
         "--exclude=.cluster.conf",
         "--exclude=.cluster_ready",
+        "--exclude=.iree_runtime/",   # shipped separately (large prebuilt dylibs)
         f"{REPO_ROOT}/",
         f"{ssh_target(conf)}:{conf['CLUSTER_DIR']}/",
     ], check=True)
@@ -102,11 +207,24 @@ def sync_code(conf):
 
 
 def do_setup(conf):
-    print("Bootstrapping cluster...")
-    rssh(conf, "brew install pueue && brew services start pueue || true")
+    print("Bootstrapping cluster (IREE-Metal stack)...")
+    rssh(conf, "brew install pueue uv && brew services start pueue || true")
     rssh(conf, f"mkdir -p {conf['CLUSTER_DIR']}")
     sync_code(conf)
-    rssh(conf, f"pip3 install -r {conf['CLUSTER_DIR']}/requirements.txt")
+    # Isolated venv + IREE/JAX deps (kept separate from the system python).
+    print("Creating venv and installing deps on the cluster...")
+    rssh(conf, "uv venv ~/.venvs/iree --python 3.13")
+    rssh(conf, "uv pip install --python ~/.venvs/iree/bin/python "
+               f"-r {conf['CLUSTER_DIR']}/requirements.txt")
+    # Hybrid provisioning: ship prebuilt patched dylibs, else build from source.
+    shipped = ship_iree_bundle(conf)
+    if not shipped or not iree_loads_ok(conf):
+        if shipped:
+            print("  Shipped dylibs failed to load — falling back to source build.")
+        build_iree_on_cluster(conf)
+        if not iree_loads_ok(conf):
+            die("IREE-Metal stack failed to load after build. See logs above.")
+    print("  IREE-Metal stack verified on cluster.")
     SENTINEL.touch()
     print("Cluster ready.")
 
@@ -116,17 +234,23 @@ def ensure_ready(conf):
         do_setup(conf)
     else:
         sync_code(conf)
-        rssh(conf, f"pip3 install -q -r {conf['CLUSTER_DIR']}/requirements.txt")
 
 
 def submit_job(conf, cmd, label=""):
     """Write a job script to the cluster and submit via pueue. Returns job ID string."""
     job_script = f"/tmp/cluster_job_{int(time.time())}.sh"
     hf_line    = f"export HF_TOKEN={conf['HF_TOKEN']}" if conf.get("HF_TOKEN") else ""
+    # Only export a validly-formatted W&B key (40+ chars); otherwise leave the
+    # cluster's own `wandb login` in place rather than overriding it with a
+    # placeholder (which would fail auth).
+    _wk        = conf.get("WANDB_API_KEY", "")
+    wandb_line = f"export WANDB_API_KEY={_wk}" if len(_wk) >= 40 else ""
     script     = (
         f"#!/bin/bash\n"
         f"export PATH=/opt/homebrew/bin:$PATH\n"
         f"{hf_line}\n"
+        f"{wandb_line}\n"
+        f"{iree_env_preamble(conf)}\n"   # route jobs through the IREE-Metal stack
         f"cd {conf['CLUSTER_DIR']}\n"
         f"{cmd}\n"
     )
@@ -239,10 +363,12 @@ def cmd_generate(args, conf):
     # shlex.quote each arg so multi-word prompts survive the SSH round-trip
     args_str = " ".join(shlex.quote(a) for a in args)
     hf_env   = f"export HF_TOKEN={conf['HF_TOKEN']}; " if conf.get("HF_TOKEN") else ""
+    preamble = iree_env_preamble(conf).replace("\n", "; ")
     full_cmd  = (
         f"export PATH=/opt/homebrew/bin:$PATH; "
         f"{hf_env}"
-        f"cd {conf['CLUSTER_DIR']} && python3 -u generate.py {args_str}"
+        f"{preamble}; "
+        f"cd {conf['CLUSTER_DIR']} && {VENV_PY} -u generate.py {args_str}"
     )
     # -t allocates a pseudo-TTY so Ctrl-C propagates to the remote process
     subprocess.run(["ssh", "-t", ssh_target(conf), full_cmd])
@@ -252,7 +378,7 @@ def cmd_train(args, conf):
     """Submit a training job and surface the W&B run URL."""
     ensure_ready(conf)
     args_str = " ".join(shlex.quote(a) for a in args)
-    cmd      = f"python3 -u train.py {args_str}"
+    cmd      = f"{VENV_PY} -u train.py {args_str}"
     label    = f"train {args_str}".strip()
 
     print(f"Submitting: {cmd}")
@@ -274,7 +400,7 @@ def cmd_submit(script, args, conf):
     """Generic queued submission for scripts other than train/generate."""
     ensure_ready(conf)
     if   (REPO_ROOT / f"{script}.py").exists():
-        cmd = f"python3 -u {script}.py"
+        cmd = f"{VENV_PY} -u {script}.py"
     elif (REPO_ROOT / f"{script}.sh").exists():
         cmd = f"bash {script}.sh"
     elif (REPO_ROOT / script).is_file() and os.access(REPO_ROOT / script, os.X_OK):

@@ -1,8 +1,10 @@
+from functools import partial
+
 import jax                          # Core JAX library: handles autodiff, JIT compilation, random numbers
 import jax.numpy as jnp              # JAX's version of NumPy — same API but runs on GPU/TPU and supports autodiff
 from jax import random               # JAX's random number module (different from Python's random — must pass keys explicitly)
 
-from attention import attention      # Cross-platform attention dispatch (see attention.py)
+from attention import attention, PLATFORM  # Cross-platform attention dispatch (see attention.py)
 
 # ---------------------------------------------------------------------------
 # HYPERPARAMETERS
@@ -18,7 +20,11 @@ D_FF        = 2048     # Hidden size of the feed-forward sublayer. Kept at 4 * D
 N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
 MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
 
-COMPUTE_DTYPE    = jnp.bfloat16  # Forward-pass dtype; stored params stay float32.
+# Forward-pass dtype (stored params stay float32). fp16 on Metal because IREE's
+# metal-spirv target for Apple GPUs advertises fp16 but NOT bf16 (bf16 matmuls
+# fail to legalize); bf16 elsewhere (CUDA/CPU), whose wider exponent range makes
+# mixed-precision training more stable.
+COMPUTE_DTYPE = jnp.float16 if "metal" in PLATFORM else jnp.bfloat16
 
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS
@@ -390,6 +396,36 @@ def model_forward(params, token_ids):
 #   - temperature > 1.0  → flatter distribution, more random/creative
 # ---------------------------------------------------------------------------
 
+@partial(jax.jit, static_argnames=("n_tokens",))
+def _generate_jit(params, prompt_ids, n_tokens, key, temperature):
+    """JIT core of generate: fixed-size token buffer + lax.scan.
+
+    Keeping the whole loop inside jit (a) avoids the per-step eager random ops
+    that emit a Sharding custom_call the IREE-Metal backend can't legalize, and
+    (b) is faster everywhere. Each step runs the model on the full buffer; causal
+    masking means the logit we read depends only on already-filled positions, so
+    the trailing zeros don't affect the result.
+    """
+    plen = prompt_ids.shape[0]                       # static within the trace
+    total = plen + n_tokens
+    # Build via concatenate + write via where-mask rather than `.at[].set()`:
+    # scatter/dynamic-update miscompiles on the IREE metal-spirv backend.
+    buf = jnp.concatenate([prompt_ids, jnp.zeros((n_tokens,), jnp.int32)])
+    positions = jnp.arange(total)
+
+    def step(carry, i):
+        buf, key = carry
+        logits = model_forward(params, buf)          # (total, VOCAB_SIZE), causal
+        next_logits = logits[plen + i - 1] / temperature   # gather read (ok on metal)
+        key, subkey = random.split(key)
+        tok = random.categorical(subkey, next_logits).astype(jnp.int32)
+        buf = jnp.where(positions == (plen + i), tok, buf)  # no scatter
+        return (buf, key), None
+
+    (buf, _), _ = jax.lax.scan(step, (buf, key), jnp.arange(n_tokens))
+    return buf
+
+
 def generate(params, prompt_ids, n_tokens, key, temperature=1.0):
     """
     Autoregressively generates n_tokens new tokens given a prompt.
@@ -402,52 +438,10 @@ def generate(params, prompt_ids, n_tokens, key, temperature=1.0):
 
     Returns: 1D integer array of shape (len(prompt_ids) + n_tokens,)
     """
-
-    tokens = prompt_ids
-    # Start with the prompt. We'll append to this array one token at a time.
-
-    for _ in range(n_tokens):
-        # --- Step 1: Truncate to context window and run forward pass ---
-        context = tokens[-MAX_SEQ_LEN:]
-        # As generation continues, the sequence grows beyond MAX_SEQ_LEN.
-        # We can't process more tokens than we have positional embeddings for,
-        # so we take only the most recent MAX_SEQ_LEN tokens.
-        # This is exactly what real LLMs do — older context falls off the left edge.
-
-        logits = model_forward(params, context)
-        # Shape: (seq_len, VOCAB_SIZE)
-        # logits[i] = scores for the token that follows position i.
-
-        next_logits = logits[-1]
-        # Take only the last row — the prediction for what comes after the final token.
-        # Shape: (VOCAB_SIZE,)
-
-        # --- Step 2: Apply temperature ---
-        next_logits = next_logits / temperature
-        # Dividing by temperature < 1 makes the scores more spread out (sharper peaks).
-        # Dividing by temperature > 1 compresses the scores closer together (flatter).
-        # At temperature = 1.0 this is a no-op.
-
-        # --- Step 3: Convert logits to probabilities ---
-        probs = jax.nn.softmax(next_logits)
-        # Softmax: exp(logit_i) / sum(exp(logit_j) for all j)
-        # Turns raw scores into a probability distribution that sums to 1.
-        # Shape: (VOCAB_SIZE,)
-
-        # --- Step 4: Sample one token from the distribution ---
-        key, subkey = random.split(key)
-        # Split the key before each use — JAX requires a fresh key per random call.
-
-        next_token = random.categorical(subkey, next_logits)
-        # random.categorical draws one sample from a categorical distribution.
-        # It takes logits directly (applies softmax internally), returns an integer index.
-        # That index is the sampled token ID.
-        # Shape: scalar integer.
-
-        # --- Step 5: Append sampled token to sequence ---
-        tokens = jnp.append(tokens, next_token)
-        # jnp.append concatenates the new token onto the end of the sequence.
-        # Next iteration, the model sees one more token and predicts the one after that.
-
-    return tokens
-    # Shape: (len(prompt_ids) + n_tokens,) — the full sequence including the original prompt.
+    prompt_ids = jnp.asarray(prompt_ids, dtype=jnp.int32)
+    # The buffer holds prompt + generated; positions index the (MAX_SEQ_LEN)
+    # positional table, so cap total length, trimming the oldest prompt tokens.
+    if prompt_ids.shape[0] + n_tokens > MAX_SEQ_LEN:
+        prompt_ids = prompt_ids[-(MAX_SEQ_LEN - n_tokens):]
+    return _generate_jit(params, prompt_ids, n_tokens, key,
+                         jnp.asarray(temperature, jnp.float32))

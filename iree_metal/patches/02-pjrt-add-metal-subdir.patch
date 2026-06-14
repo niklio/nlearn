@@ -1,0 +1,11 @@
+diff --git a/integrations/pjrt/src/CMakeLists.txt b/integrations/pjrt/src/CMakeLists.txt
+index d0f4947..8e06ad5 100644
+--- a/integrations/pjrt/src/CMakeLists.txt
++++ b/integrations/pjrt/src/CMakeLists.txt
+@@ -33,3 +33,6 @@ endif()
+ if(IREE_HAL_DRIVER_VULKAN)
+   add_subdirectory(iree_pjrt/vulkan)
+ endif()
++if(IREE_HAL_DRIVER_METAL)
++  add_subdirectory(iree_pjrt/metal)
++endif()
