@@ -409,14 +409,14 @@ class StreamingLoader:
 # SECTION 5: TRAINING LOOP
 # ---------------------------------------------------------------------------
 
-def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR,
+def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR,
           run_name=None, dataset="fineweb-edu"):
-    warmup = min(WARMUP_STEPS, n_steps // 5)
+    warmup = min(WARMUP_STEPS, steps // 5)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
         warmup_steps=warmup,
-        decay_steps=n_steps,
+        decay_steps=steps,
         end_value=peak_lr / 10,
     )
     optimizer = optax.adam(learning_rate=schedule)
@@ -428,7 +428,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
         project="nlearn-transformer",
         name=run_name,
         config={
-            "n_steps":      n_steps,
+            "steps":      steps,
             "seq_len":      seq_len,
             "batch_size":   batch_size,
             "peak_lr":      peak_lr,
@@ -466,7 +466,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     print(f"Training on {dataset}, batch_size={batch_size}, seq_len={seq_len}")
     print(f"Model parameters: {n_params:,}")
     print_attention_config()
-    print(f"Running for {n_steps} steps...\n")
+    print(f"Running for {steps} steps...\n")
 
     # Benchmark in the model's compute dtype (bf16 isn't supported on the
     # IREE metal-spirv target). Non-fatal: it's only used for MFU logging.
@@ -484,7 +484,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     timer = StepTimer()
 
     loss = None
-    for step in range(n_steps):
+    for step in range(steps):
         timer.start()
         batch = loader.get_batch()
         timer.mark_data()
@@ -493,7 +493,7 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
         jax.block_until_ready(loss)
         timer.mark_train()
 
-        logger.log_step(step, loss, timer, params, n_steps)
+        logger.log_step(step, loss, timer, params, steps)
 
         if step > 0 and step % CHECKPOINT_EVERY == 0:
             save_checkpoint(params, step, run_name=run_name)
@@ -505,20 +505,8 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
             sys.exit(0)
 
     # --- Save final checkpoint ---
-    final_path = save_checkpoint(params, n_steps, run_name=run_name)
+    final_path = save_checkpoint(params, steps, run_name=run_name)
     logger.print_summary(loss)
-
-    # --- Generate a sample ---
-    enc = tiktoken.get_encoding("gpt2")
-    prompt = "The history of artificial intelligence"
-    print(f"Generating text from prompt '{prompt}'...")
-    key, gen_key = random.split(key)
-    prompt_ids = jnp.array(enc.encode(prompt))
-    output_ids = generate(params, prompt_ids, n_tokens=200, key=gen_key, temperature=0.8)
-    output_text = enc.decode([int(t) for t in output_ids])
-    print(f"Output:\n{output_text}\n")
-
-    wandb.log({"generated_text": wandb.Html(f"<pre>{output_text}</pre>")})
 
     artifact = wandb.Artifact(name="model-checkpoint", type="model")
     artifact.add_file(final_path)
@@ -532,12 +520,12 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--n_steps",    type=int,   default=N_STEPS)
-    p.add_argument("--seq_len",    type=int,   default=512)
+    p.add_argument("--steps",      type=int,   default=N_STEPS)
+    p.add_argument("--seq-len",    type=int,   default=512)
     p.add_argument("--seed",       type=int,   default=0)
-    p.add_argument("--batch_size", type=int,   default=BATCH_SIZE)
-    p.add_argument("--peak_lr",    type=float, default=PEAK_LR)
-    p.add_argument("--run_name",   type=str,   default=None)
+    p.add_argument("--batch-size", type=int,   default=BATCH_SIZE)
+    p.add_argument("--peak-lr",    type=float, default=PEAK_LR)
+    p.add_argument("--run-name",   type=str,   default=None)
     p.add_argument("--dataset",    type=str,   default="fineweb-edu",
                    choices=list(DATASETS.keys()))
     args = p.parse_args()
