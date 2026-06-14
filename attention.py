@@ -22,13 +22,20 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 
 def _detect_platform():
-    """Return 'cuda', 'metal', or 'cpu'."""
+    """Return 'cuda', 'metal', or 'cpu'.
+
+    'metal' covers both Apple's jax-metal plugin (platform "metal") and the
+    open-source IREE PJRT plugin targeting the Metal HAL driver (platform
+    "iree_metal"). Both lack a fused attention kernel through the standard XLA
+    path, so they share the _attention_standard implementation. (A native IREE
+    Metal FlashAttention kernel is dispatched separately; see attention().)
+    """
     try:
         device = jax.devices()[0]
         platform = device.platform.lower()
-        if platform == "gpu":
+        if platform == "gpu" or "cuda" in platform:
             return "cuda"
-        elif platform == "metal":
+        elif "metal" in platform:
             return "metal"
     except Exception:
         pass

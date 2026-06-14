@@ -135,8 +135,8 @@ def cross_entropy_loss(params, token_ids):
 
     for i in range(_N_CHUNKS):
         chunk_start  = i * VOCAB_CHUNK_SIZE
-        chunk_logits = x @ W_chunks[i]                     # (seq_len, VOCAB_CHUNK_SIZE)
-        chunk_logits = jnp.where(_VOCAB_MASK[i], chunk_logits, -jnp.inf)
+        raw_logits   = x @ W_chunks[i]                     # (seq_len, VOCAB_CHUNK_SIZE)
+        chunk_logits = jnp.where(_VOCAB_MASK[i], raw_logits, -jnp.inf)
 
         chunk_max = chunk_logits.max(axis=-1)
         new_max   = jnp.maximum(running_max, chunk_max)
@@ -149,7 +149,14 @@ def cross_entropy_loss(params, token_ids):
 
         in_chunk      = (target_ids >= chunk_start) & (target_ids < chunk_start + VOCAB_CHUNK_SIZE)
         safe_idx      = jnp.clip(target_ids - chunk_start, 0, VOCAB_CHUNK_SIZE - 1)
-        chunk_correct = chunk_logits[jnp.arange(seq_len), safe_idx]
+        # Select the target token's logit via one-hot multiply rather than
+        # advanced indexing (chunk_logits[arange, safe_idx]). The gather's
+        # backward is a scatter, which IREE's metal-spirv path miscompiles under
+        # vmap (malformed tensor.expand_shape). One-hot select has a pure
+        # broadcast/reduce backward that lowers cleanly, at the cost of an extra
+        # (seq_len, VOCAB_CHUNK_SIZE) tensor we already materialise anyway.
+        onehot        = jax.nn.one_hot(safe_idx, VOCAB_CHUNK_SIZE, dtype=raw_logits.dtype)
+        chunk_correct = jnp.sum(raw_logits * onehot, axis=-1)  # raw (not -inf-masked) avoids 0*-inf=NaN
         correct_logit = jnp.where(in_chunk, chunk_correct, correct_logit)
 
     final_max, final_sum_exp = running_max, running_sum_exp
