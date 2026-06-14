@@ -14,6 +14,8 @@ Why Metal can't use fused attention kernels:
   fallback is jax.pure_callback which routes GPU→CPU→GPU, killing performance.
 """
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -49,6 +51,84 @@ def _has_cudnn_attention():
 
 PLATFORM = _detect_platform()
 HAS_CUDNN = PLATFORM == "cuda" and _has_cudnn_attention()
+
+
+def _is_iree_metal():
+    try:
+        return jax.devices()[0].platform.lower() == "iree_metal"
+    except Exception:
+        return False
+
+
+# Native Metal FlashAttention kernel is available only on the IREE-Metal backend
+# (Apple's jax-metal can't run custom kernels). Disable with NLEARN_DISABLE_FLASH=1.
+USE_IREE_FLASH = _is_iree_metal() and os.environ.get("NLEARN_DISABLE_FLASH") != "1"
+
+
+# ---------------------------------------------------------------------------
+# Native Metal FlashAttention (IREE-Metal) via custom kernels + custom_vjp
+#
+# Forward/backward dispatch to hand-authored MSL kernels (flash_attention.metal)
+# embedded as external metal-msl-fb objects. A custom IREE preprocessing pass
+# (ConvertFlashAttentionDispatch) lowers these custom_calls to flow.dispatch.
+# Kernels run in f32 (the metal-spirv target lacks bf16); inputs are cast at the
+# boundary and results cast back. Memory is O(seq) in both directions.
+#
+# Attention runs under vmap (batched_loss_fn), so the FFI uses
+# vmap_method="sequential" — correct under batching; one GPU dispatch per batch
+# element. (A batch-flattening fast path is a later optimization.)
+# ---------------------------------------------------------------------------
+
+def _flash_fwd_raw(Q, K, V):
+    """(n,s,d) f32 -> O (n,s,d), L (n,s) logsumexp. Emits a custom_call the
+    IREE pass turns into a dispatch of flash_attention_fwd."""
+    n, s, d = Q.shape
+    return jax.ffi.ffi_call(
+        "flash_attention_fwd",
+        (jax.ShapeDtypeStruct((n, s, d), jnp.float32),
+         jax.ShapeDtypeStruct((n, s), jnp.float32)),
+        vmap_method="sequential",
+    )(Q, K, V)
+
+
+@jax.custom_vjp
+def _attention_iree_flash(Q, K, V):
+    in_dtype = Q.dtype
+    Qf, Kf, Vf = (x.astype(jnp.float32) for x in (Q, K, V))
+    O, _ = _flash_fwd_raw(Qf, Kf, Vf)
+    return O.astype(in_dtype)
+
+
+def _flash_fwd_rule(Q, K, V):
+    in_dtype = Q.dtype
+    Qf, Kf, Vf = (x.astype(jnp.float32) for x in (Q, K, V))
+    O, L = _flash_fwd_raw(Qf, Kf, Vf)
+    # Residuals must be JAX types only (no Python dtype objects). The cotangent
+    # dO carries the output dtype, so the backward recovers in_dtype from it.
+    return O.astype(in_dtype), (Qf, Kf, Vf, O, L)
+
+
+def _flash_bwd_rule(res, dO):
+    Qf, Kf, Vf, O, L = res
+    in_dtype = dO.dtype
+    n, s, d = Qf.shape
+    dOf = dO.astype(jnp.float32)
+    D = jnp.sum(dOf * O, axis=-1)  # (n, s); D_i = dO_i . O_i
+    dQ = jax.ffi.ffi_call(
+        "flash_attention_bwd_dq",
+        jax.ShapeDtypeStruct((n, s, d), jnp.float32),
+        vmap_method="sequential",
+    )(Qf, Kf, Vf, dOf, L, D)
+    dK, dV = jax.ffi.ffi_call(
+        "flash_attention_bwd_dkdv",
+        (jax.ShapeDtypeStruct((n, s, d), jnp.float32),
+         jax.ShapeDtypeStruct((n, s, d), jnp.float32)),
+        vmap_method="sequential",
+    )(Qf, Kf, Vf, dOf, L, D)
+    return (dQ.astype(in_dtype), dK.astype(in_dtype), dV.astype(in_dtype))
+
+
+_attention_iree_flash.defvjp(_flash_fwd_rule, _flash_bwd_rule)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +194,8 @@ def attention(Q, K, V):
     """
     if HAS_CUDNN:
         return _attention_cudnn(Q, K, V)
+    if USE_IREE_FLASH:
+        return _attention_iree_flash(Q, K, V)
     return _attention_standard(Q, K, V)
 
 
@@ -122,5 +204,7 @@ def print_attention_config():
     print(f"  Platform:  {PLATFORM}")
     if HAS_CUDNN:
         print(f"  Attention: cuDNN flash attention")
+    elif USE_IREE_FLASH:
+        print(f"  Attention: native Metal FlashAttention (IREE custom kernel)")
     else:
         print(f"  Attention: standard matmul")

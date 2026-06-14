@@ -12,9 +12,16 @@ export JAX_PLATFORMS=iree_metal
 # (the pip iree-base-compiler lacks it).
 export IREE_PJRT_COMPILER_LIB_PATH="$_IREE_BUILD/iree_core/lib/libIREECompiler.dylib"
 
-# The from-source compiler needs lld to serialize the llvm-cpu host helper
-# executables; reuse the one bundled with the pip iree package.
+# Compiler option passed through to iree-compile by the plugin: the embedded
+# linker (lld) for the llvm-cpu host helpers the from-source compiler emits
+# (reuse the pip-bundled one). NOTE: --iree-hal-executable-object-search-path is
+# NOT a global compiler flag (the plugin's flag parser rejects it), so instead
+# the FlashAttention pass reads the kernel's ABSOLUTE path from
+# NLEARN_FLASH_KERNEL_PATH below (findFileInPaths resolves absolute paths).
 export IREE_PJRT_IREE_COMPILER_OPTIONS="--iree-llvmcpu-embedded-linker-path=$_VENV/lib/python3.13/site-packages/iree/compiler/_mlir_libs/iree-lld"
+
+# Absolute path to the hand-authored Metal FlashAttention kernel object.
+export NLEARN_FLASH_KERNEL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/iree_metal/kernels/flash_attention.metal"
 
 # Quieter logs (set to debug to see compiler/driver detail).
 export IREE_PJRT_LOG_LEVEL=error
