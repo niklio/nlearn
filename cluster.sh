@@ -168,7 +168,7 @@ case "${1:-}" in
   *)
     SCRIPT="$1"
     shift
-    ARGS="$*"
+    ARGS=$(printf '%q ' "$@")
 
     if [ -f "${REPO_ROOT}/${SCRIPT}.py" ]; then
       CMD="python3 -u ${SCRIPT}.py ${ARGS}"
