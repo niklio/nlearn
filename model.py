@@ -4,7 +4,7 @@ import jax                          # Core JAX library: handles autodiff, JIT co
 import jax.numpy as jnp              # JAX's version of NumPy — same API but runs on GPU/TPU and supports autodiff
 from jax import random               # JAX's random number module (different from Python's random — must pass keys explicitly)
 
-from attention import attention      # Cross-platform attention dispatch (see attention.py)
+from attention import attention, PLATFORM  # Cross-platform attention dispatch (see attention.py)
 
 # ---------------------------------------------------------------------------
 # HYPERPARAMETERS
@@ -20,11 +20,11 @@ D_FF        = 2048     # Hidden size of the feed-forward sublayer. Kept at 4 * D
 N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
 MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
 
-COMPUTE_DTYPE    = jnp.float16  # Forward-pass dtype; stored params stay float32.
-# fp16, not bf16: IREE's metal-spirv target for Apple GPUs advertises fp16 but
-# NOT bf16 (the SPIR-V target capabilities omit it), so bf16 matmuls fail to
-# legalize. fp16 has a narrow exponent range, so training uses loss scaling to
-# keep gradients representable (see train.py).
+# Forward-pass dtype (stored params stay float32). fp16 on Metal because IREE's
+# metal-spirv target for Apple GPUs advertises fp16 but NOT bf16 (bf16 matmuls
+# fail to legalize); bf16 elsewhere (CUDA/CPU), whose wider exponent range makes
+# mixed-precision training more stable.
+COMPUTE_DTYPE = jnp.float16 if "metal" in PLATFORM else jnp.bfloat16
 
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS
