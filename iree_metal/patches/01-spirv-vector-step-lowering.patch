@@ -1,0 +1,16 @@
+diff --git a/compiler/src/iree/compiler/Codegen/SPIRV/SPIRVFinalVectorLowering.cpp b/compiler/src/iree/compiler/Codegen/SPIRV/SPIRVFinalVectorLowering.cpp
+index 166a3bd..2433895 100644
+--- a/compiler/src/iree/compiler/Codegen/SPIRV/SPIRVFinalVectorLowering.cpp
++++ b/compiler/src/iree/compiler/Codegen/SPIRV/SPIRVFinalVectorLowering.cpp
+@@ -91,6 +91,11 @@ public:
+       vector::populateVectorGatherToConditionalLoadPatterns(patterns);
+       vector::populateVectorGatherLoweringPatterns(patterns);
+       vector::populateVectorMaskOpLoweringPatterns(patterns);
++      // Lower vector.step to a constant/arith sequence. The SPIR-V conversion
++      // has no pattern for vector.step (unlike the NVVM/ROCDL/CPU paths, which
++      // call this in their ConvertToLLVM passes), so without this any iota /
++      // jnp.arange that survives into a vectorized kernel fails to legalize.
++      vector::populateVectorStepLoweringPatterns(patterns);
+       vector::CreateMaskOp::getCanonicalizationPatterns(patterns, context);
+       vector::populateVectorShapeCastLoweringPatterns(patterns);
+       if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
