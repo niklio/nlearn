@@ -19,12 +19,44 @@ from jax import random
 import optax
 import tiktoken
 
-from model import init_model, VOCAB_SIZE
+from model import init_model, model_forward, VOCAB_SIZE
 import attention as A
-import train as T
+
+
+# Simple full-vocab cross-entropy. NOTE: train.py's memory-efficient 13-chunk
+# CE is numerically wrong on the experimental metal-spirv backend (a fusion/
+# codegen bug in the large unrolled loop; every individual op is correct), which
+# drives the loss negative under overfitting. The unchunked CE compiles
+# correctly. Uses one-hot select instead of gather (gather's backward is a
+# scatter, which also miscompiles under vmap on metal-spirv).
+def simple_ce(params, token_ids):
+    logits = model_forward(params, token_ids[:-1])              # (seq, vocab)
+    lse = jax.scipy.special.logsumexp(logits, axis=-1)
+    oh = jax.nn.one_hot(token_ids[1:], VOCAB_SIZE, dtype=logits.dtype)
+    cor = jnp.sum(logits * oh, axis=-1)
+    return -(cor - lse).mean()
+
+
+_batched_loss = jax.vmap(simple_ce, in_axes=(None, 0))
+
+
+def _batch_loss(params, batch):
+    return jnp.mean(_batched_loss(params, batch))
+
+
+def make_train_step(optimizer):
+    loss_and_grad = jax.value_and_grad(_batch_loss)
+
+    def train_step(params, opt_state, batch):
+        loss, grads = loss_and_grad(params, batch)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+
+    return jax.jit(train_step)
 
 N_STEPS = int(sys.argv[1]) if len(sys.argv) > 1 else 100
-B, L = 8, 128  # batch, seq_len
+B, L = 2, 64    # small batch/seq: fewer sequential flash dispatches (runtime-hang mitigation)
 
 print(f"backend: {jax.default_backend()}  attention: "
       f"{'native Metal FlashAttention' if A.USE_IREE_FLASH else 'standard'}")
@@ -54,7 +86,7 @@ n_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
 print(f"params: {n_params:,}")
 optimizer = optax.adam(1e-3)
 opt_state = optimizer.init(params)
-step_fn = T.make_train_step(optimizer)
+step_fn = make_train_step(optimizer)
 
 losses = []
 step_times = []

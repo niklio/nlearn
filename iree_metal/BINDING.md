@@ -18,8 +18,29 @@ Everything *below* the JAX frontend is proven working — the COMPLETE kernel se
    `flash_extern_test.mlir`: the exact IR the binding emits; correct on GPU
    (2.38e-7). ✅
 
-So the kernels are usable on Metal via IREE *today* through hand-MLIR. Only the
-automatic JAX→kernel wiring remains.
+So the kernels are usable on Metal via IREE *today* through hand-MLIR.
+
+## JAX binding — DONE
+
+5. **Compiler pass `ConvertFlashAttentionDispatch`** (patches/05-07) lowers
+   `stablehlo.custom_call @flash_attention_{fwd,bwd_dq,bwd_dkdv}` to a
+   `flow.dispatch` of the external kernel (shape-specialized string-template
+   wrapper; object resolved by absolute path from `NLEARN_FLASH_KERNEL_PATH`). ✅
+6. **`attention.py`** `_attention_iree_flash` = `jax.ffi.ffi_call` + `jax.custom_vjp`
+   (fwd saves Q,K,V,O,L; bwd computes D then dq + dkdv kernels). ✅
+7. Forward+gradient validated vs NumPy (2.4e-7); the full model **trains on the
+   M3 GPU** through the kernels (~1.3s/step). ✅
+
+### Caveat: a separate metal-spirv fusion bug (not the kernel)
+
+The experimental metal-spirv backend miscompiles some large *composed* graphs
+even though every individual op is correct in isolation (verified vs CPU). It
+makes `_attention_standard` wrong (1.75) — the flash kernel fixes that — and
+makes train.py's 13-chunk cross-entropy drive the loss negative under
+overfitting. Workaround: a simple unchunked one-hot CE (see
+`train_flash_local.py:simple_ce`) compiles correctly. Also: gather's backward
+(scatter) miscompiles under vmap, so use one-hot select (not `take_along_axis`)
+in losses.
 
 ## Remaining work (the JAX frontend binding + training)
 
