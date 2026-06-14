@@ -215,8 +215,7 @@ def do_setup(conf):
     print("Creating venv and installing deps on the cluster...")
     rssh(conf, "uv venv ~/.venvs/iree --python 3.13")
     rssh(conf, "uv pip install --python ~/.venvs/iree/bin/python "
-               "jax==0.6.1 jaxlib==0.6.1 iree-base-compiler==3.11.0 "
-               "iree-base-runtime==3.11.0 optax tiktoken numpy wandb datasets")
+               f"-r {conf['CLUSTER_DIR']}/requirements.txt")
     # Hybrid provisioning: ship prebuilt patched dylibs, else build from source.
     shipped = ship_iree_bundle(conf)
     if not shipped or not iree_loads_ok(conf):

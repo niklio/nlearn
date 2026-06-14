@@ -1,8 +1,19 @@
-jax==0.4.26
-jaxlib==0.4.26
-jax-metal==0.1.0
-optax==0.1.9
-wandb
-datasets
+# Python deps for the IREE-Metal stack (Apple Silicon).
+#
+# This is only the pip-installable half. The native Metal FlashAttention runtime
+# also needs the patched IREE compiler + PJRT plugin dylibs, which are NOT on
+# PyPI — cluster.py ships prebuilt ones (or builds from source) and the env is
+# wired up in iree_env.sh. See iree_metal/README.md for the full setup.
+#
+# jax/jaxlib and iree-base-* are pinned: the prebuilt plugin/compiler dylibs are
+# built against the jaxlib 0.6.1 PJRT ABI and the IREE 3.11.0 runtime, and
+# iree-base-compiler provides the iree-lld used to link llvm-cpu host helpers.
+jax==0.6.1
+jaxlib==0.6.1
+iree-base-compiler==3.11.0
+iree-base-runtime==3.11.0
+optax
 tiktoken
 numpy
+wandb
+datasets
