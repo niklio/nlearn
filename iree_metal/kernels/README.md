@@ -12,7 +12,8 @@ motivated the whole IREE migration.
 | Forward kernel (`flash_attention.metal`) | ✅ authored; compiles to AIR + metallib (`xcrun metal`); online-softmax recurrence verified vs standard causal attention (max abs diff 1.2e-7). NB: written with simple `[[buffer(N)]]` params — must be rewritten to the argument-buffer ABI below before it can bind. |
 | Compiler: Metal external-object support | ✅ patched (`patches/04`): `MetalSPIRVTarget::serializeExternalExecutable` embeds a provided MSL object into the metal flatbuffer (Metal had no external path; Vulkan did). Compiler rebuilt clean. |
 | Metal dispatch ABI | ✅ reverse-engineered (see below + `abi_reference/`) |
-| Hand-MLIR trivial dispatch on Metal (iree-run-module) | ⏳ next: prove the external path end-to-end |
+| Hand-MLIR trivial dispatch on Metal (iree-run-module) | ✅ `test/spike.mlir` + `spike_mul.metal`: out=2*4=8 on the M3 GPU |
+| FlashAttention kernel on Metal via IREE | ✅ `test/flash_test.mlir` + `validate_flash.py`: matches NumPy reference to 2.4e-7 on the GPU |
 | Frontend: `stablehlo.custom_call` → `flow.dispatch` | ⏳ patch `StableHLOCustomCalls.cpp` so JAX can invoke it |
 | `jax.ffi` wiring in `attention.py` | ⏳ |
 | Backward pass (dQ/dK/dV) + custom_vjp | ⏳ deferred until forward binds end-to-end |
