@@ -136,65 +136,35 @@ def init_attention(key):
 
 def attention_forward(params, x):
     """
-    Chunked multi-head self-attention.
+    Standard multi-head self-attention.
+    For seq_len ≤ ~1024 this is fastest on Metal — one fused matmul that XLA
+    can compile as a single kernel. Switch to chunked (ATTN_CHUNK_SIZE) if
+    you increase seq_len to the point where the seq×seq matrix causes OOM.
 
-    x:    input of shape (seq_len, D_MODEL)
-    Returns output of shape (seq_len, D_MODEL)
+    x: input of shape (seq_len, D_MODEL)
+    Returns: (seq_len, D_MODEL)
     """
     seq_len, _ = x.shape
     d_head = D_MODEL // N_HEADS
-    scale  = jnp.sqrt(jnp.array(d_head, dtype=COMPUTE_DTYPE))
 
-    # --- Step 1: Project and split into heads ---
-    # Each: (seq_len, D_MODEL) → reshape → (seq_len, N_HEADS, d_head)
-    #                          → transpose → (N_HEADS, seq_len, d_head)
     Q = (x @ params['W_q']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
     K = (x @ params['W_k']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
     V = (x @ params['W_v']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
+    # All: (N_HEADS, seq_len, d_head)
 
-    # --- Step 2: Chunked online-softmax attention ---
-    # Process K/V in blocks to keep peak memory O(seq_len × ATTN_CHUNK_SIZE).
-    # State maintained across chunks (all shape (N_HEADS, seq_len)):
-    q_pos       = jnp.arange(seq_len)
-    running_max = jnp.full((N_HEADS, seq_len), -jnp.inf, dtype=COMPUTE_DTYPE)
-    running_sum = jnp.zeros((N_HEADS, seq_len),           dtype=COMPUTE_DTYPE)
-    running_out = jnp.zeros((N_HEADS, seq_len, d_head),   dtype=COMPUTE_DTYPE)
+    scale  = jnp.sqrt(jnp.array(d_head, dtype=x.dtype))
+    scores = jnp.matmul(Q, K.transpose(0, 2, 1)) / scale
+    # (N_HEADS, seq_len, seq_len) — causal mask applied via triu of -inf
 
-    n_chunks = (seq_len + ATTN_CHUNK_SIZE - 1) // ATTN_CHUNK_SIZE
-    for i in range(n_chunks):
-        cs = i * ATTN_CHUNK_SIZE
-        ce = min(cs + ATTN_CHUNK_SIZE, seq_len)
+    q_pos  = jnp.arange(seq_len)
+    mask   = jnp.where(q_pos[:, None] >= q_pos[None, :],
+                       jnp.zeros((), dtype=x.dtype),
+                       jnp.full((), -jnp.inf, dtype=x.dtype))
+    scores = scores + mask[None, :, :]
 
-        K_c = K[:, cs:ce, :]  # (N_HEADS, chunk_size, d_head)
-        V_c = V[:, cs:ce, :]
-
-        # Scores for this chunk: Q @ K_chunk^T / sqrt(d_head)
-        # Shape: (N_HEADS, seq_len, chunk_size)
-        scores = jnp.matmul(Q, K_c.transpose(0, 2, 1)) / scale
-
-        # Causal mask: query at position i may attend to key at position j only if j ≤ i.
-        # k_pos are the absolute positions of keys in this chunk [cs, ce).
-        k_pos  = jnp.arange(cs, ce)
-        causal = jnp.where(
-            q_pos[:, None] >= k_pos[None, :],  # (seq_len, chunk_size)
-            jnp.zeros((), dtype=COMPUTE_DTYPE),
-            jnp.full((), -jnp.inf, dtype=COMPUTE_DTYPE),
-        )
-        scores = scores + causal[None, :, :]  # broadcast over N_HEADS
-
-        # Online softmax update — rescale running state before adding new chunk.
-        chunk_max   = scores.max(axis=-1)                          # (N_HEADS, seq_len)
-        new_max     = jnp.maximum(running_max, chunk_max)
-        old_rescale = jnp.exp(running_max - new_max)              # (N_HEADS, seq_len)
-        chunk_exp   = jnp.exp(scores - new_max[:, :, None])       # (N_HEADS, seq_len, chunk_size)
-
-        running_sum = running_sum * old_rescale + chunk_exp.sum(axis=-1)
-        running_out = running_out * old_rescale[:, :, None] + jnp.matmul(chunk_exp, V_c)
-        running_max = new_max
-
-    # --- Step 3: Normalise, concatenate heads, and project ---
-    out = running_out / running_sum[:, :, None]   # (N_HEADS, seq_len, d_head)
-    out = out.transpose(1, 0, 2).reshape(seq_len, D_MODEL)
+    weights = jax.nn.softmax(scores, axis=-1)
+    out     = jnp.matmul(weights, V)                       # (N_HEADS, seq_len, d_head)
+    out     = out.transpose(1, 0, 2).reshape(seq_len, D_MODEL)
     return out @ params['W_o']
 
 
