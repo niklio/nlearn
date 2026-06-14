@@ -206,8 +206,29 @@ END_LR       = 1e-4    # End learning rate — decay to 10% of peak by the final
 #   4. Apply updates → nudge every parameter to reduce the loss
 # ---------------------------------------------------------------------------
 
-batched_loss_fn = jax.vmap(cross_entropy_loss, in_axes=(None, 0))
-# jax.vmap (vectorized map) transforms cross_entropy_loss so it runs on a whole
+def _simple_cross_entropy_loss(params, token_ids):
+    """Unchunked full-vocab cross-entropy. Used on the IREE-Metal backend, whose
+    metal-spirv compiler miscompiles the 13-chunk loop in cross_entropy_loss (a
+    fusion/codegen bug — every individual op is correct, but the composed loop
+    yields a wrong, eventually-negative loss). Materialises the (seq, VOCAB)
+    logit matrix, so it costs more memory than the chunked path. One-hot select
+    (not gather) avoids a scatter-under-vmap miscompile on the same backend."""
+    input_ids  = token_ids[:-1]
+    target_ids = token_ids[1:]
+    logits = model_forward(params, input_ids)               # (seq, VOCAB_SIZE)
+    log_Z  = jax.scipy.special.logsumexp(logits, axis=-1)
+    onehot = jax.nn.one_hot(target_ids, VOCAB_SIZE, dtype=logits.dtype)
+    correct_logit = jnp.sum(logits * onehot, axis=-1)
+    return -(correct_logit - log_Z).mean()
+
+
+import attention as _attn
+# Pick the loss for the active backend: chunked (memory-efficient) on CUDA/CPU,
+# simple full-vocab on IREE-Metal (the chunked one miscompiles there).
+_active_ce = _simple_cross_entropy_loss if _attn.USE_IREE_FLASH else cross_entropy_loss
+
+batched_loss_fn = jax.vmap(_active_ce, in_axes=(None, 0))
+# jax.vmap (vectorized map) transforms the loss so it runs on a whole
 # batch at once instead of one sequence at a time.
 # in_axes=(None, 0) means:
 #   - params (first arg): don't batch over this — share the same params across all sequences
@@ -427,7 +448,9 @@ def train(n_steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=P
     key, model_key = random.split(key)
 
     print("Initializing model...")
-    params = init_model(model_key)
+    # jit the init: eager random.normal emits a Sharding custom_call that the
+    # IREE-Metal backend can't legalize; running it inside jit avoids that.
+    params = jax.jit(init_model)(model_key)
     opt_state = optimizer.init(params)
 
     # Graceful interrupt: set a flag in the signal handler, check it each step.
