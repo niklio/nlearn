@@ -62,10 +62,15 @@ add the target name to the pass, wire the VJP).
 
 ## P1 — enablers (throughput, stability, bigger batch/seq)
 
-- [ ] **Batch-aware attention dispatch — remove `vmap_method="sequential"`.**
-  Today each attention call issues `batch_size` separate dispatches. Flatten
-  batch into the kernel grid (one dispatch); speeds up throughput and removes the
-  dispatch count that triggers the runtime hangs. *Effort: medium.*
+- [~] **Batch-aware attention dispatch — remove `vmap_method="sequential"`.**
+  *Deferred (evidence-based).* Its two motivations both evaporated: (1) the hang it
+  was meant to fix was the validation loop, not train-step dispatch count (see
+  below); (2) it would only help *large*-batch throughput, but measured MFU is best
+  at small batch (B=2/4: 59%; B=8: 46%) and memory is never the limit (~2.5 GB at
+  B=8) — so we don't want large batch. Step time scales ~linearly with batch
+  (constant throughput), so the B=2/4 runs we actually use see ~no benefit. Not
+  worth the model-refactor / `custom_vmap` risk. Revisit only if large global batch
+  becomes desirable.
 - [x] **Root-cause the Metal HAL runtime hang.** *DONE.* Bisected exhaustively:
   the flash kernels are fine in isolation (fwd/bwd/vmap/chained up to seq=512), the
   full train_step is fine, and `train.py` only hung at seq≥256 — the trigger was the
@@ -74,11 +79,16 @@ add the target name to the pass, wire the VJP).
   at seq=128 where each pass is smaller). Fix: cap validation to `NLEARN_VAL_BATCHES`
   (default 20) in `logging_utils._compute_val_loss`. seq=512 / 10 steps now trains
   with validation, no hang (1.0s/step with GEMM, MFU ~59%).
-- [ ] **bf16 support in the `metal-spirv` target.** M3 supports bf16 in HW; IREE
-  doesn't codegen it (forces fp16). bf16's wider range removes the need for loss
-  scaling and reduces wasted long runs. *Effort: medium (compiler target).*
-- [ ] **fp16 dynamic loss scaling (interim, until bf16).** Guards against silent
-  gradient underflow over long runs. *Effort: low.*
+- [~] **bf16 support in the `metal-spirv` target.** *Deferred.* High-effort,
+  uncertain compiler work (bf16 fails at `vector.bitcast` SPIR-V legalization; needs
+  new lowering + spirv-cross→MSL support). Its purpose — wider dynamic range so loss
+  scaling isn't needed — is covered by the interim below, which is now in place. Not
+  a blocker for training; revisit if fp16+loss-scaling proves insufficient.
+- [x] **fp16 loss scaling (interim, until bf16).** *DONE.* Static scale (default
+  2^10, `NLEARN_LOSS_SCALE`) in `make_train_step`: scale the loss so small gradients
+  survive the fp16 backward, unscale before the optimizer update. Static (no
+  `lax.cond` overflow-skip — metal-spirv miscompiles control flow). Loss trajectory
+  unchanged; guards long runs against silent gradient underflow.
 
 ## P2 — memory headroom & instrumentation
 
