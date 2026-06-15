@@ -33,11 +33,16 @@ add the target name to the pass, wire the VJP).
 
 ## P0 — routines that gate long-context training
 
-- [ ] **Tiled FlashAttention kernel (simdgroup_matrix + threadgroup tiles).**
-  Current kernel is correct but scalar (one thread/query, no tiling, no matrix
-  units). Rewrite FA-2 style (block over Q/K/V tiles in threadgroup memory,
-  `simdgroup_matrix` for QKᵀ and PV, online softmax across K-blocks); same for
-  the backward kernels. *Biggest "write a Metal driver" win. Effort: high.*
+- [~] **FlashAttention kernel throughput.** Forward kernel **vectorized (float4
+  loads + dot/FMA) → 2.4× faster** (6.9 ms → 2.8 ms at H=8,S=512,D=64), correct,
+  same ABI (no compiler/JAX changes). *Finding:* a threadgroup-**tiled** variant
+  (shared K/V staging) was ~50% *slower* and `simdgroup_matrix` doesn't fit the
+  one-thread-per-query layout — occupancy + the GPU cache beat manual staging,
+  same lesson as the GEMM sweep. The backward kernels are register/occupancy-bound
+  (vectorizing them gave no gain), so they stay scalar. **Remaining (optional):** a
+  full FA-2 cooperative-matrix rewrite (restructure to 8×8 tiles, 2D head-aware
+  grid) — needs a compiler-pass change for the grid; uncertain payoff given the
+  occupancy findings. *Effort: high.*
 - [~] **Custom Metal GEMM with `simdgroup_matrix`.** *Diagnostic done
   ([`iree_metal/kernels/GEMM.md`](iree_metal/kernels/GEMM.md)): not a flag — IREE's
   Apple target has `mmaCount=0` and spirv-cross can't emit `simdgroup_matrix`, so

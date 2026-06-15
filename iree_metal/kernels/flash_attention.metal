@@ -15,6 +15,7 @@
 using namespace metal;
 
 #define MAX_DHEAD 128
+#define MAX_DHEAD4 32   // MAX_DHEAD / 4 (float4 lanes)
 #define TG_SIZE_X 64u   // must match each export's workgroup_size
 
 struct PushConstants {
@@ -34,6 +35,11 @@ struct FwdBindings {
   device       float* L [[id(4)]];   // [n_heads, seq_len] log-sum-exp per query
 };
 
+// One thread per query (online softmax over causal keys). Zero threadgroup
+// memory → maximum occupancy; the Apple GPU cache serves the shared K/V reads.
+// (A threadgroup-staged "tiled" variant measured ~50% SLOWER here — occupancy and
+// caching beat manual staging, same lesson as the GEMM sweep.) The win vs the
+// naive scalar loop is float4-vectorized loads + dot/FMA on Q·K and the V accum.
 kernel void flash_attention_fwd(
     constant FwdBindings&   args [[buffer(0)]],
     constant PushConstants& p    [[buffer(3)]],
@@ -43,31 +49,33 @@ kernel void flash_attention_fwd(
     const uint g = lid.x + wgid.x * TG_SIZE_X;
     if (g >= p.n_heads * p.seq_len) return;
     const uint h = g / p.seq_len, q = g % p.seq_len, d = p.d_head;
+    const uint dq = d >> 2;                           // float4 lanes (d % 4 == 0)
     const float scale = 1.0f / sqrt((float)d);
-    const uint head_off = h * p.seq_len * d;
-    const uint q_off = head_off + q * d;
+    const uint head_off4 = (h * p.seq_len * d) >> 2;
+    const uint q_off4 = head_off4 + q * dq;
+    device const float4* Q4 = (device const float4*)args.Q;
+    device const float4* K4 = (device const float4*)args.K;
+    device const float4* V4 = (device const float4*)args.V;
 
-    float qreg[MAX_DHEAD];
-    for (uint i = 0; i < d; ++i) qreg[i] = args.Q[q_off + i];
+    float4 qreg[MAX_DHEAD4], acc[MAX_DHEAD4];
+    for (uint i = 0; i < dq; ++i) { qreg[i] = Q4[q_off4 + i]; acc[i] = float4(0.0f); }
 
     float m = -INFINITY, l = 0.0f;
-    float acc[MAX_DHEAD];
-    for (uint i = 0; i < d; ++i) acc[i] = 0.0f;
-
-    for (uint k = 0; k <= q; ++k) {                 // causal k<=q
-        const uint k_off = head_off + k * d;
+    for (uint k = 0; k <= q; ++k) {                  // causal k<=q
+        const uint k_off4 = head_off4 + k * dq;
         float s = 0.0f;
-        for (uint i = 0; i < d; ++i) s += qreg[i] * args.K[k_off + i];
+        for (uint i = 0; i < dq; ++i) s += dot(qreg[i], K4[k_off4 + i]);
         s *= scale;
         const float m_new = max(m, s);
         const float corr = exp(m - m_new), w = exp(s - m_new);
         l = l * corr + w;
-        for (uint i = 0; i < d; ++i) acc[i] = acc[i] * corr + w * args.V[k_off + i];
+        for (uint i = 0; i < dq; ++i) acc[i] = acc[i] * corr + w * V4[k_off4 + i];
         m = m_new;
     }
     const float inv_l = 1.0f / l;
-    for (uint i = 0; i < d; ++i) args.O[q_off + i] = acc[i] * inv_l;
-    args.L[h * p.seq_len + q] = m + log(l);          // logsumexp
+    device float4* O4 = (device float4*)args.O;
+    for (uint i = 0; i < dq; ++i) O4[q_off4 + i] = acc[i] * inv_l;
+    args.L[h * p.seq_len + q] = m + log(l);           // logsumexp
 }
 
 // ---------------------------------------------------------------------------
@@ -98,6 +106,9 @@ kernel void flash_attention_bwd_dq(
     const uint head_off = h * p.seq_len * d;
     const uint i_off = head_off + i * d;
 
+    // (Scalar: vectorizing this kernel gave no speedup — it's register/occupancy-
+    // bound on the per-thread q/dO/dq arrays, not load-width bound. Only the
+    // forward benefits from float4 loads.)
     float qreg[MAX_DHEAD], doreg[MAX_DHEAD], dq[MAX_DHEAD];
     for (uint e = 0; e < d; ++e) { qreg[e] = args.Q[i_off + e]; doreg[e] = args.dO[i_off + e]; dq[e] = 0.0f; }
     const float Li = args.L[h * p.seq_len + i];
@@ -144,6 +155,7 @@ kernel void flash_attention_bwd_dkdv(
     const uint head_off = h * p.seq_len * d;
     const uint j_off = head_off + j * d;
 
+    // (Scalar — same reason as bwd_dq: register/occupancy-bound, float4 gave no win.)
     float kreg[MAX_DHEAD], vreg[MAX_DHEAD], dk[MAX_DHEAD], dv[MAX_DHEAD];
     for (uint e = 0; e < d; ++e) { kreg[e] = args.K[j_off + e]; vreg[e] = args.V[j_off + e]; dk[e] = 0.0f; dv[e] = 0.0f; }
 
