@@ -479,7 +479,13 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
         decay_steps=eff_updates,
         end_value=peak_lr / 10,
     )
-    optimizer = optax.adam(learning_rate=schedule)
+    # Gradient clipping (global-norm): our fp16 custom-kernel gradients are noisier
+    # than jax-metal's, so lr=1e-3 diverged unclipped (loss bottomed then climbed as
+    # LR reached peak). Clipping caps the occasional large-norm step that triggers
+    # divergence, raising the stable LR ceiling toward the reference's 1e-3.
+    GRAD_CLIP = float(os.environ.get("NLEARN_GRAD_CLIP", "1.0"))
+    base = optax.adam(learning_rate=schedule)
+    optimizer = optax.chain(optax.clip_by_global_norm(GRAD_CLIP), base) if GRAD_CLIP > 0 else base
     if GRAD_ACCUM > 1:
         optimizer = optax.MultiSteps(optimizer, every_k_schedule=GRAD_ACCUM)
         print(f"Gradient accumulation: {GRAD_ACCUM} micro-batches/update "
