@@ -44,28 +44,69 @@ wired into JAX (the custom_call → `flow.dispatch` compiler pass + `custom_vjp`
    execution — one big dispatch per op, not bs× sequential ones** (the deferred
    "batch-aware dispatch" P1, now the central lever).
 
-### Phases
+### The linchpin
 
-- **Phase 0 — Reproduce the loss target (de-risk loss, ignore speed).** Run **bs32,
-  peak_lr=1e-3, 1000 steps** on the *current* stack (sequential, slow, if it fits).
-  *Milestone: val ≤ ~5.8.* Proves the loss is achievable on our kernels and isolates
-  loss from throughput. If it OOMs → Phase 1 first.
-- **Phase 1 — Memory for bs32 (if Phase 0 OOMs).** The `(bs, seq, vocab)` logits +
-  one-hot in `_simple_cross_entropy_loss` are ~3.3 GB *each* at bs32 (≈10 GB with
-  backward). Implement a **fused / online-softmax cross-entropy** (no full-logit-row
-  materialization). *Milestone: bs32 trains within 16 GB (~9 GB like the reference).*
-- **Phase 2 — Throughput / MFU (the central work; close the ~6× gap).** Move off
-  `vmap`-sequential to **batched execution** so kernels see big shapes:
-  (2a) flatten `(bs,seq,d)→(bs·seq,d)` → each matmul is ONE GEMM with M=16384;
-  (2b) one flash dispatch over `(bs·heads,seq,d)`; (2c) batched/fused CE;
-  (2d) re-tune kernels at the real model shapes (GEMM was tuned at 2048³).
-  *Milestone: end-to-end ≥ ~1.5–2.4 TFLOPS, MFU ≥ ~60%, bs32 step ≤ ~3–4 s.*
-- **Phase 3 — Competitive run.** Tune LR/schedule/optimizer to track the reference
-  curve; run the 1000-step (and longer) competitive run. *Milestone: **val ≤ 5.71 at
-  MFU competitive with jax-metal** — the headline deliverable.*
-- **Phase 4 — Surpass / scale (open-ended).** More tokens (loss < 5.6); larger
-  model/context; kernels toward MLX-level (register-blocked GEMM, FA-2 simdgroup
-  attention); bf16; KV-cache eval.
+The **batched-execution refactor** delivers *both* goals at once: it removes the
+32-way `vmap`-sequential graph (fixing the bs32 miscompile → correctness), feeds the
+kernels big batched shapes (one GEMM at M=bs·seq, one flash over bs·heads → MFU), and
+reshapes memory into the layout jax-metal used. So it's the backbone of the plan.
+Grad-accumulation (bs8 micro-batches ×4) is a **loss-only fallback** if batched bs32
+memory proves intractable.
+
+### Day-by-day plan
+
+**Day 1 — Batched-execution refactor (model.py + train.py).** *Correctness first.*
+- `gemm_iree`: a `linear(x, W)` that flattens leading dims `(…, K)→(N_tok, K)`, runs
+  the 2D GEMM (M=N_tok), reshapes back. (Kernel unchanged.)
+- `attention_forward`: operate on `(bs, seq, d)`; reshape `→ (bs·heads, seq, dh)`,
+  call `_attention_iree_flash` directly (NO vmap → one dispatch), reshape back.
+- `ffn_forward` / `layer_norm` / `embed`: take a leading `bs` dim (last-axis ops are
+  already batch-safe; just thread the shape through).
+- `model_forward(_features)`: `token_ids` is `(bs, seq)`.
+- `train.py`: drop `batched_loss_fn = vmap(...)`; `batch_loss`/CE operate on
+  `(bs, seq[, vocab])` directly.
+- **Gate D1:** batched model trains correctly at bs4/bs8 — loss curve matches the old
+  vmap path (numeric parity on a few steps), each matmul is a single big GEMM
+  (verify shapes/dispatch count).
+
+**Day 2 — bs32 correctness + memory.**
+- Run batched model at **bs32**. Expectation: the loss-0/nan miscompile is gone (no
+  32-way vmap; single batched ops, smaller graph). Confirm loss sane + decreasing.
+- Memory: `(bs·seq, vocab)` logits ≈ 3.3 GB + one-hot + backward ≈ ~10 GB → may OOM.
+  Fix in order of preference: (a) **vocab-chunked CE in batched form** (select target
+  logit without a full one-hot — careful: gather-backward miscompiles, so use a
+  metal-spirv-safe reduction); (b) **fused MSL cross-entropy kernel** (loss + dlogits,
+  no logit-row materialization — new kernel + dispatch-pass binding + custom_vjp);
+  (c) **gradient accumulation** (bs8 micro ×4) as the fallback.
+- **Gate D2:** bs32 trains correctly within 16 GB (target ≈ 9 GB), loss decreasing.
+
+**Day 3 — Throughput / MFU.**
+- Profile the bs32 step with `iree-benchmark-module` on the *real* shapes; attribute
+  time to GEMMs / flash / CE / overhead.
+- Re-tune the GEMM at the model's shapes (M=16384, K/N ∈ {512, 2048, 50272}) — it was
+  tuned at 2048³; sweep tile/BK there. Re-tune flash at `(bs·heads=256, seq=512, dh=64)`.
+- Cut dispatch overhead; fuse where cheap.
+- **Gate D3:** end-to-end **≥ ~1.5–2.4 TFLOPS, MFU ≥ ~60%, bs32 step ≤ ~3–4 s.**
+
+**Day 4 — Competitive run.**
+- Match the reference schedule (peak_lr **1e-3**, end_lr 1e-4, warmup 200); confirm
+  1e-3 is stable at bs32 (reference says yes). Run **1000 steps**, monitor loss curve
+  vs reference, MFU, mem; checkpoint every 1000 / cap val.
+- **Gate D4 (HEADLINE):** **val ≤ 5.71 at MFU competitive with jax-metal.**
+
+**Day 5+ — Harden / surpass.**
+- If loss short: tune LR/warmup/init/optimizer to the reference exactly; longer run.
+- If MFU short: deeper kernel work — register-blocked GEMM toward MLX's ~2.9 TFLOPS,
+  FA-2 simdgroup-matrix attention.
+- Stretch: more tokens (loss < 5.6), bf16, larger model/context, KV-cache eval.
+
+### Risks & fallbacks
+- *Batched graph still miscompiles* → bisect (proven method); fall back to grad-accum.
+- *bs32 CE OOM* → chunked CE → fused CE kernel → grad-accum (in that order).
+- *Flash at bs·heads=256 or one huge dispatch misbehaves* → it's one dispatch (not the
+  many-dispatch accumulation that caused the val hang), but verify; tile heads if needed.
+- *1e-3 diverges at real bs32* (shouldn't — reference used it) → scale LR / longer warmup.
+- Every phase has a correctness gate; don't advance until met. Record results below.
 
 ### Autonomous execution protocol
 One experiment at a time; GPU-health check + `pkill` between runs (hung kernels need
@@ -77,7 +118,14 @@ step) in the log below; commit working changes; capture compiler edits as patche
 
 ### Results log
 - (baseline) bs4 / lr3e-4 / 10k → val ~7.1, MFU ~57%, ~0.4 TFLOPS  [run_10k_lr3e4]
-- Phase 0: bs32 / lr1e-3 / 1000 → _in progress_
+- **bs32 feasibility (vmap-sequential): DEAD END.** GEMM-off → OOM
+  (`RESOURCE_EXHAUSTED` on the bs32 logits); GEMM-on → loss 0/nan (32-way vmap graph
+  miscompiles on metal-spirv) + 52 s/step. ⇒ Phase 0 blocked; Phase 1+2 both required.
+- **Key insight:** kernels already accept batched shapes (GEMM takes any M ⇒
+  `(bs·seq, d)` in one dispatch; flash loops per-"head" ⇒ `(bs·heads, seq, d)` in one
+  dispatch). **Phase 2 = model/train refactor to batched execution** (drop
+  vmap-sequential), which fixes miscompile + memory-shape + MFU at once.
+- Phase 2: batched-execution refactor → _in progress_
 
 ---
 
