@@ -59,6 +59,37 @@ def load_checkpoint(path):
     # JAX will automatically move them back to the GPU when used in computations.
     return params
 
+
+def _resume_path(run_name):
+    subdir = os.path.join(CHECKPOINT_DIR, run_name) if run_name else CHECKPOINT_DIR
+    return os.path.join(subdir, "resume.pkl")
+
+
+def save_resume_state(params, opt_state, step, run_name=None):
+    """Full training state (params + optimizer state + step) for auto-resume after a
+    GPU/Metal-HAL hang. Written atomically (tmp + rename) so a crash mid-write can't
+    corrupt the resume file. The LR schedule position lives in opt_state, so resuming
+    continues the schedule correctly; the data stream just continues with fresh data."""
+    path = _resume_path(run_name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state = {"params": jax.device_get(params),
+             "opt_state": jax.device_get(opt_state),
+             "step": int(step)}
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(state, f)
+    os.replace(tmp, path)
+
+
+def load_resume_state(run_name=None):
+    """Return (params, opt_state, next_step) if a resume file exists, else None."""
+    path = _resume_path(run_name)
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        state = pickle.load(f)
+    return state["params"], state["opt_state"], state["step"]
+
 # ---------------------------------------------------------------------------
 # SECTION 1: LOSS FUNCTION
 #
@@ -310,7 +341,7 @@ def make_train_step(optimizer):
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 32
-CHECKPOINT_EVERY = 1000
+CHECKPOINT_EVERY = int(os.environ.get("NLEARN_CHECKPOINT_EVERY", "1000"))
 
 # ---------------------------------------------------------------------------
 # DATASET REGISTRY
@@ -435,7 +466,7 @@ class StreamingLoader:
 # ---------------------------------------------------------------------------
 
 def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR,
-          run_name=None, dataset="fineweb-edu"):
+          run_name=None, dataset="fineweb-edu", resume=False):
     # With gradient accumulation (GRAD_ACCUM micro-steps per update), the LR schedule
     # advances per EFFECTIVE update, so build it over steps//GRAD_ACCUM and run the
     # loop for `steps` micro-steps. (GRAD_ACCUM=1 ⇒ unchanged.)
@@ -460,6 +491,8 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
     wandb.init(
         project="nlearn-transformer",
         name=run_name,
+        id=run_name if run_name else None,   # fixed id so resumed segments share one curve
+        resume="allow",
         config={
             "steps":      steps,
             "seq_len":      seq_len,
@@ -485,6 +518,16 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
     # IREE-Metal backend can't legalize; running it inside jit avoids that.
     params = jax.jit(init_model)(model_key)
     opt_state = optimizer.init(params)
+
+    # Auto-resume after a GPU hang: if a resume file exists for this run, restore
+    # params + optimizer state (incl. LR-schedule position) and continue from there.
+    start_step = 0
+    _resumed = load_resume_state(run_name) if resume else None
+    if _resumed is not None:
+        params, opt_state, start_step = _resumed
+        params = jax.device_put(params)
+        opt_state = jax.device_put(opt_state)
+        print(f"Resumed from step {start_step} (resume.pkl)")
 
     # Graceful interrupt: set a flag in the signal handler, check it each step.
     _stop = {"requested": False}
@@ -517,7 +560,7 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
     timer = StepTimer()
 
     loss = None
-    for step in range(steps):
+    for step in range(start_step, steps):
         timer.start()
         batch = loader.get_batch()
         timer.mark_data()
@@ -530,6 +573,8 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
 
         if step > 0 and step % CHECKPOINT_EVERY == 0:
             save_checkpoint(params, step, run_name=run_name)
+            # Full state for auto-resume across hangs (params + opt_state + next step).
+            save_resume_state(params, opt_state, step + 1, run_name=run_name)
 
         if _stop["requested"]:
             print("Saving checkpoint before exit...")
@@ -561,5 +606,7 @@ if __name__ == "__main__":
     p.add_argument("--run-name",   type=str,   default=None)
     p.add_argument("--dataset",    type=str,   default="fineweb-edu",
                    choices=list(DATASETS.keys()))
+    p.add_argument("--resume", action="store_true",
+                   help="resume from this run's checkpoints/<run>/resume.pkl if present")
     args = p.parse_args()
     train(**vars(args))
