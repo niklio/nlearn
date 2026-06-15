@@ -35,11 +35,14 @@ add the target name to the pass, wire the VJP).
   units). Rewrite FA-2 style (block over Q/K/V tiles in threadgroup memory,
   `simdgroup_matrix` for QKᵀ and PV, online softmax across K-blocks); same for
   the backward kernels. *Biggest "write a Metal driver" win. Effort: high.*
-- [ ] **Custom Metal GEMM with `simdgroup_matrix`.** 0.8 TFLOPS caps the whole
-  model (MLP, projections, lm_head). Do the diagnostic (below) first; if codegen
-  is naive, route big matmuls through a custom MSL GEMM on the matrix
-  coprocessor. *Impact: very high (everything). Effort: medium–high, or low if
-  it's a flag.*
+- [~] **Custom Metal GEMM with `simdgroup_matrix`.** *Diagnostic done
+  ([`iree_metal/kernels/GEMM.md`](iree_metal/kernels/GEMM.md)): not a flag — IREE's
+  Apple target has `mmaCount=0` and spirv-cross can't emit `simdgroup_matrix`, so
+  a custom kernel is required.* A correct `simdgroup_matrix` GEMM
+  (`iree_metal/kernels/gemm.metal`) is built + validated but only ~0.94 TFLOPS
+  (single-simdgroup register ceiling). **Remaining:** multi-simdgroup tiled GEMM
+  (target ~8–10 TFLOPS) + integrate the model's big matmuls. *Impact: very high
+  (everything). Effort: medium–high.*
 - [ ] **Fused cross-entropy kernel (online-softmax, no logit materialization).**
   The simple CE materializes the `(L × 50257)` logit matrix (~1.6 GB/seq at
   L=8k, ×batch ×fwd+bwd); the chunked CE that avoided it is broken on
