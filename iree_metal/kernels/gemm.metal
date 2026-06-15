@@ -4,10 +4,18 @@
 // M4) because (a) its Apple target advertises no MMA ops and (b) spirv-cross
 // can't translate cooperative-matrix SPIR-V to MSL simdgroup_matrix. So we hand-
 // write the GEMM with simdgroup_matrix and bind it via the custom-dispatch pass.
+// See kernels/GEMM.md.
 //
-// C[M,N] = A[M,K] @ B[K,N], f16 in/out, f32 accumulate. Requires M,N,K multiples
-// of 8 (the simdgroup_matrix tile size). IREE Metal ABI: bindings in the
-// argument buffer at [[buffer(0)]], push constants at [[buffer(3)]].
+// C[M,N] = A[M,K] @ B[K,N], f16 in/out f32 accumulate. Requires M,N,K multiples
+// of the block (BM/BN). IREE Metal ABI: bindings in the argument buffer at
+// [[buffer(0)]], push constants at [[buffer(3)]].
+//
+// Multi-simdgroup design: a threadgroup of SG_M*SG_N simdgroups computes a
+// BM x BN tile of C, sharing one BM x BK / BK x BN slab staged in threadgroup
+// memory each K-step. Each simdgroup owns a WM x WN sub-tile of TM x TN 8x8
+// tiles — kept at <=2x2 so its accumulators fit in simdgroup registers (4x4
+// silently overflows). Sharing the staged slab across simdgroups gives the reuse
+// + occupancy a single simdgroup can't.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -15,47 +23,37 @@ using namespace metal;
 struct GemmBindings {
   device const half*  A [[id(0)]];  // M x K, row-major
   device const half*  B [[id(1)]];  // K x N, row-major
-  device       float* C [[id(2)]];  // M x N, row-major (f32; simdgroup_store
-                                    // requires the dest type to match the f32
-                                    // accumulator — cast to f16 at the JAX edge)
+  device       float* C [[id(2)]];  // M x N, row-major (f32 accumulate output)
 };
 
 struct GemmParams { uint M; uint N; uint K; };
 
-// One simdgroup (32 threads) per threadgroup computes a BM x BN block of C as
-// TM x TN 8x8 tiles. Each K-step stages a BM x BK slab of A and a BK x BN slab
-// of B into threadgroup memory (loaded cooperatively by all 32 threads), then
-// the matrix units consume them with full reuse — so global-memory traffic drops
-// by ~TN/TM× and the kernel becomes compute-bound on the matrix coprocessor.
-// CORRECTNESS LIMIT (measured on M4): with ONE simdgroup per threadgroup, the
-// accumulator array acc[TM][TN] must fit in simdgroup registers. TM=TN=2 (4
-// accumulators) is exact; TM=TN=4 (16) silently corrupts (register overflow).
-// PERF: at 2×2 this is ~0.94 TFLOPS (vs ~0.8 naive) — correct but not the win.
-// To approach the M4's ~teens-TFLOPS peak, the next step is a MULTI-simdgroup
-// GEMM: N simdgroups per threadgroup share one large staged BMxBK / BKxBN tile,
-// each computing a small sub-tile (≤2×2) within its register budget. See
-// kernels/GEMM.md.
-#define BM 16
-#define BN 16
-#define BK 8
-#define TM (BM / 8)   // 8x8 output tiles down M
-#define TN (BN / 8)   // 8x8 output tiles across N
+#define SG_M 2            // simdgroups down M
+#define SG_N 2            // simdgroups across N
+#define WM   16           // rows per simdgroup
+#define WN   16           // cols per simdgroup
+#define BM   (SG_M * WM)  // 32
+#define BN   (SG_N * WN)  // 32
+#define BK   32           // K-slab depth: thicker = fewer barriers, more compute/stage
+#define TM   (WM / 8)     // 2 — 8x8 tiles per simdgroup down M
+#define TN   (WN / 8)     // 2 — across N
+#define NTHREADS (SG_M * SG_N * 32)   // 128
 
 kernel void gemm_sg(
     constant GemmBindings& args [[buffer(0)]],
     constant GemmParams&   p    [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]],
-    uint  tid  [[thread_index_in_threadgroup]])
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sg   [[simdgroup_index_in_threadgroup]])
 {
     threadgroup half As[BM][BK];
     threadgroup half Bs[BK][BN];
 
-    const uint row0 = tgid.y * BM;
+    const uint row0 = tgid.y * BM;             // block origin in C
     const uint col0 = tgid.x * BN;
+    const uint sr = (sg / SG_N) * WM;          // this simdgroup's sub-tile offset
+    const uint sc = (sg % SG_N) * WN;
 
-    // NOTE: loops over the simdgroup_matrix arrays MUST be fully unrolled — these
-    // matrices live in registers and Metal can't dynamically index them; without
-    // unrolling the multi-tile accumulation silently produces wrong results.
     simdgroup_float8x8 acc[TM][TN];
 #pragma clang loop unroll(full)
     for (uint i = 0; i < TM; ++i)
@@ -64,29 +62,33 @@ kernel void gemm_sg(
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
-        // Cooperatively stage A (BM*BK) and B (BK*BN) into threadgroup memory.
-        for (uint e = tid; e < BM * BK; e += 32) {
+        // All NTHREADS cooperatively stage the shared A/B slabs.
+        for (uint e = tid; e < BM * BK; e += NTHREADS) {
             uint r = e / BK, c = e % BK;
             As[r][c] = args.A[(row0 + r) * p.K + (k0 + c)];
         }
-        for (uint e = tid; e < BK * BN; e += 32) {
+        for (uint e = tid; e < BK * BN; e += NTHREADS) {
             uint r = e / BN, c = e % BN;
             Bs[r][c] = args.B[(k0 + r) * p.N + (col0 + c)];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        simdgroup_half8x8 a[TM], b[TN];
+        // Consume the staged slab in 8-deep K steps (BK/8 of them per barrier).
 #pragma clang loop unroll(full)
-        for (uint i = 0; i < TM; ++i)
-            simdgroup_load(a[i], &As[i * 8][0], BK);
+        for (uint kk = 0; kk < BK; kk += 8) {
+            simdgroup_half8x8 a[TM], b[TN];
 #pragma clang loop unroll(full)
-        for (uint j = 0; j < TN; ++j)
-            simdgroup_load(b[j], &Bs[0][j * 8], BN);
-#pragma clang loop unroll(full)
-        for (uint i = 0; i < TM; ++i)
+            for (uint i = 0; i < TM; ++i)
+                simdgroup_load(a[i], &As[sr + i * 8][kk], BK);
 #pragma clang loop unroll(full)
             for (uint j = 0; j < TN; ++j)
-                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                simdgroup_load(b[j], &Bs[kk][sc + j * 8], BN);
+#pragma clang loop unroll(full)
+            for (uint i = 0; i < TM; ++i)
+#pragma clang loop unroll(full)
+                for (uint j = 0; j < TN; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -95,5 +97,6 @@ kernel void gemm_sg(
     for (uint i = 0; i < TM; ++i)
 #pragma clang loop unroll(full)
         for (uint j = 0; j < TN; ++j)
-            simdgroup_store(acc[i][j], args.C + (row0 + i * 8) * p.N + (col0 + j * 8), p.N);
+            simdgroup_store(acc[i][j],
+                args.C + (row0 + sr + i * 8) * p.N + (col0 + sc + j * 8), p.N);
 }

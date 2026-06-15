@@ -13,11 +13,11 @@ module @g attributes {hal.device.targets = [#dev]} {
           #hal.pipeline.binding<storage_buffer, ReadOnly>, #hal.pipeline.binding<storage_buffer, ReadOnly>,
           #hal.pipeline.binding<storage_buffer>]>)
         count(%d: !hal.device, %wn: index, %wm: index) -> (index, index, index) {
-      %x = affine.apply affine_map<()[s0] -> (s0 ceildiv 16)>()[%wn]
-      %y = affine.apply affine_map<()[s0] -> (s0 ceildiv 16)>()[%wm]
+      %x = affine.apply affine_map<()[s0] -> (s0 ceildiv 32)>()[%wn]
+      %y = affine.apply affine_map<()[s0] -> (s0 ceildiv 32)>()[%wm]
       %c1 = arith.constant 1 : index
       hal.return %x, %y, %c1 : index, index, index
-    } attributes {workgroup_size = [32 : index, 1 : index, 1 : index]}
+    } attributes {workgroup_size = [128 : index, 1 : index, 1 : index]}
   }
   func.func @run_gemm(%A: tensor<1024x1024xf16>, %B: tensor<1024x1024xf16>) -> tensor<1024x1024xf32> {
     %wn = arith.constant 1024 : index
