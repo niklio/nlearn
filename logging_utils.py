@@ -162,7 +162,7 @@ class TrainingLogger:
                   f"tflops: {tflops:.2f}  mfu: {mfu:.1%}  mem: {mem_mb:.0f}MB  "
                   f"step: {timer.step_time:.2f}s "
                   f"(data: {timer.data_time:.3f}s  train: {timer.train_time:.2f}s)")
-        elif step % 100 == 0 or step < 5:
+        elif step % 10 == 0 or step < 5:   # frequent prints → supervisor hang-detection
             print(f"Step {step:>4}  loss: {loss:.4f}  tflops: {tflops:.2f}  mfu: {mfu:.1%}  mem: {mem_mb:.0f}MB  "
                   f"step: {timer.step_time:.2f}s "
                   f"(data: {timer.data_time:.3f}s  train: {timer.train_time:.2f}s)")
