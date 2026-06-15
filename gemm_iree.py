@@ -85,3 +85,21 @@ def matmul(A, B):
     if USE_IREE_GEMM and getattr(A, "ndim", None) == 2 and getattr(B, "ndim", None) == 2:
         return gemm(A, B)
     return jnp.matmul(A, B)
+
+
+def linear(x, W):
+    """`x[..., K] @ W[K, N] -> [..., N]` as ONE batched-flattened 2D GEMM.
+
+    This is the batched-execution path: leading dims (batch, seq, …) are flattened
+    into the GEMM's M, so e.g. (bs, seq, d) @ (d, n) is a single dispatch with
+    M = bs·seq (16384 at bs32/seq512) — where the simdgroup kernel is efficient —
+    instead of bs separate small GEMMs under vmap. Returns f32 (the kernel's
+    accumulate dtype), matching the old `matmul`/`@` path. Off IREE-Metal (or
+    non-2D W) → jnp.matmul.
+    """
+    if USE_IREE_GEMM and getattr(x, "ndim", None) is not None and x.ndim >= 2 and W.ndim == 2:
+        lead = x.shape[:-1]
+        K = x.shape[-1]
+        y = gemm(x.reshape(-1, K), W)          # (prod(lead), N) f32
+        return y.reshape(*lead, W.shape[1])
+    return jnp.matmul(x, W)

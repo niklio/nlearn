@@ -6,6 +6,7 @@ from jax import random               # JAX's random number module (different fro
 
 from attention import attention, PLATFORM  # Cross-platform attention dispatch (see attention.py)
 from gemm_iree import matmul as gemm_matmul  # custom Metal GEMM on IREE-Metal, else jnp.matmul
+from gemm_iree import linear                 # batched x[...,K]@W[K,N] as one flattened GEMM
 
 # ---------------------------------------------------------------------------
 # HYPERPARAMETERS
@@ -66,12 +67,11 @@ def embed(params, token_ids):
     token_ids: a 1D integer array of shape (seq_len,), e.g. [72, 101, 108, ...]
     Returns:   a 2D float array of shape (seq_len, D_MODEL)
     """
-    seq_len = token_ids.shape[0]   # How many tokens are in this sequence.
+    seq_len = token_ids.shape[-1]  # tokens per sequence (token_ids is (bs, seq) or (seq,)).
 
     tok = params['token_embed'][token_ids]
     # Index into the token embedding table using the token IDs.
-    # This is a lookup: for each integer in token_ids, grab its row from the table.
-    # Result shape: (seq_len, D_MODEL)
+    # For (bs, seq) ids this yields (bs, seq, D_MODEL); for (seq,) it yields (seq, D_MODEL).
 
     pos = params['pos_embed'][:seq_len]
     # Slice the positional embedding table to match the sequence length.
@@ -137,20 +137,28 @@ def attention_forward(params, x):
     can compile as a single kernel. Switch to chunked (ATTN_CHUNK_SIZE) if
     you increase seq_len to the point where the seq×seq matrix causes OOM.
 
-    x: input of shape (seq_len, D_MODEL)
-    Returns: (seq_len, D_MODEL)
+    x: input of shape (bs, seq_len, D_MODEL)
+    Returns: (bs, seq_len, D_MODEL)
+
+    Batched execution: project with one flattened GEMM each, fold the batch into the
+    head axis (bs·heads, seq, d_head), and run attention as a SINGLE flash dispatch
+    over bs·heads "heads" — no vmap, no per-sequence dispatches.
     """
-    seq_len, _ = x.shape
+    bs, seq_len, _ = x.shape
     d_head = D_MODEL // N_HEADS
+    bh = bs * N_HEADS
 
-    Q = gemm_matmul(x, params['W_q']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
-    K = gemm_matmul(x, params['W_k']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
-    V = gemm_matmul(x, params['W_v']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
-    # All: (N_HEADS, seq_len, d_head)
+    def proj(W):
+        # (bs, seq, d) -> (bs, seq, heads, dh) -> (bs, heads, seq, dh) -> (bs·heads, seq, dh)
+        return (linear(x, W).reshape(bs, seq_len, N_HEADS, d_head)
+                .transpose(0, 2, 1, 3).reshape(bh, seq_len, d_head))
 
-    out     = attention(Q, K, V)                            # (N_HEADS, seq_len, d_head)
-    out     = out.transpose(1, 0, 2).reshape(seq_len, D_MODEL)
-    return gemm_matmul(out, params['W_o'])
+    Q, K, V = proj(params['W_q']), proj(params['W_k']), proj(params['W_v'])
+
+    out = attention(Q, K, V)                                # (bs·heads, seq, d_head)
+    out = (out.reshape(bs, N_HEADS, seq_len, d_head)
+              .transpose(0, 2, 1, 3).reshape(bs, seq_len, D_MODEL))
+    return linear(out, params['W_o'])
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +259,8 @@ def ffn_forward(params, x):
     x: shape (seq_len, D_MODEL)
     Returns same shape.
     """
-    x = gemm_matmul(x, params['W1']) + params['b1']
-    # Linear projection: (seq_len, 128) @ (128, 512) + (512,) → (seq_len, 512)
+    x = linear(x, params['W1']) + params['b1']
+    # Linear projection: (..., 512) @ (512, 2048) + (2048,) → (..., 2048)
     # Each token is now represented in a 512-dimensional space.
 
     x = jax.nn.gelu(x)
@@ -261,8 +269,8 @@ def ffn_forward(params, x):
     # Used by GPT-2, GPT-3, and most modern LLMs.
     # Without a non-linearity here, two linear layers would collapse into one — no extra power.
 
-    x = gemm_matmul(x, params['W2']) + params['b2']
-    # Project back down: (seq_len, 512) @ (512, 128) + (128,) → (seq_len, D_MODEL)
+    x = linear(x, params['W2']) + params['b2']
+    # Project back down: (..., 2048) @ (2048, 512) + (512,) → (..., D_MODEL)
     # Each token is back to its original D_MODEL size, but transformed.
 
     return x  # Shape: (seq_len, D_MODEL)
@@ -383,9 +391,8 @@ def model_forward(params, token_ids):
                logits[i] = scores for what token comes after position i
     """
     x = model_forward_features(params, token_ids)
-    # lm_head is the single biggest matmul (D_MODEL x VOCAB); route it through the
-    # custom Metal GEMM kernel on IREE-Metal (gemm_matmul falls back to @ elsewhere).
-    return gemm_matmul(x, params['lm_head'])
+    # lm_head: (bs, seq, D_MODEL) @ (D_MODEL, VOCAB) as one flattened GEMM (M=bs·seq).
+    return linear(x, params['lm_head'])
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +430,7 @@ def _generate_jit(params, prompt_ids, n_tokens, key, temperature):
 
     def step(carry, i):
         buf, key = carry
-        logits = model_forward(params, buf)          # (total, VOCAB_SIZE), causal
+        logits = model_forward(params, buf[None])[0] # add/drop batch dim: (total, VOCAB)
         next_logits = logits[plen + i - 1] / temperature   # gather read (ok on metal)
         key, subkey = random.split(key)
         tok = random.categorical(subkey, next_logits).astype(jnp.int32)

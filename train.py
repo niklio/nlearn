@@ -226,34 +226,32 @@ def _simple_cross_entropy_loss(params, token_ids):
 
 
 import attention as _attn
-# Pick the loss for the active backend: chunked (memory-efficient) on CUDA/CPU,
-# simple full-vocab on IREE-Metal (the chunked one miscompiles there).
-_active_ce = _simple_cross_entropy_loss if _attn.USE_IREE_FLASH else cross_entropy_loss
-
-batched_loss_fn = jax.vmap(_active_ce, in_axes=(None, 0))
-# jax.vmap (vectorized map) transforms the loss so it runs on a whole
-# batch at once instead of one sequence at a time.
-# in_axes=(None, 0) means:
-#   - params (first arg): don't batch over this — share the same params across all sequences
-#   - token_ids (second arg): batch over axis 0 — each row is one sequence
-# The result is a function that takes (params, batch) where batch is shape
-# (BATCH_SIZE, seq_len) and returns BATCH_SIZE loss values simultaneously.
-# JAX compiles this into efficient parallel GPU operations automatically.
 
 
-def batch_loss(params, batch):
-    """
-    Computes the mean cross-entropy loss over a batch of sequences.
+def _simple_ce_batched(params, batch):
+    """Batched full-vocab cross-entropy — the whole batch in single dispatches (no
+    vmap). `batch` is (bs, seq_len+1); the model runs on (bs, seq) directly so every
+    matmul is one flattened GEMM and attention is one flash dispatch over bs·heads.
+    One-hot select (not gather) avoids the scatter miscompile on metal-spirv."""
+    input_ids  = batch[:, :-1]                              # (bs, seq)
+    target_ids = batch[:, 1:]                               # (bs, seq)
+    logits = model_forward(params, input_ids)               # (bs, seq, VOCAB_SIZE)
+    log_Z  = jax.scipy.special.logsumexp(logits, axis=-1)   # (bs, seq)
+    onehot = jax.nn.one_hot(target_ids, VOCAB_SIZE, dtype=logits.dtype)
+    correct_logit = jnp.sum(logits * onehot, axis=-1)       # (bs, seq)
+    return -(correct_logit - log_Z).mean()
 
-    params: model parameters (shared across all sequences)
-    batch:  2D integer array of shape (BATCH_SIZE, seq_len+1)
-    Returns: scalar mean loss
-    """
-    losses = batched_loss_fn(params, batch)
-    # losses shape: (BATCH_SIZE,) — one loss value per sequence in the batch.
 
-    return jnp.mean(losses)
-    # Average across the batch. This is the single number we differentiate.
+if _attn.USE_IREE_FLASH:
+    # IREE-Metal: batched execution (one dispatch per op), full-vocab simple CE.
+    def batch_loss(params, batch):
+        return _simple_ce_batched(params, batch)
+else:
+    # CUDA/CPU: keep the per-sequence chunked CE under vmap (memory-efficient there).
+    _batched_loss_fn = jax.vmap(cross_entropy_loss, in_axes=(None, 0))
+
+    def batch_loss(params, batch):
+        return jnp.mean(_batched_loss_fn(params, batch))
 
 
 loss_and_grad_fn = jax.value_and_grad(batch_loss)
