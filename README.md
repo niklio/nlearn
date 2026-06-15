@@ -164,6 +164,18 @@ edits as patches.
   time-averaged during a live step → GPU likely idle-bound (overhead/dispatch gaps),
   consistent with flat 0.6 TFLOPS. Needs `powermetrics` confirmation + jax-metal
   reference. ⇒ Day 3 also reduces GPU idle (fuse/overlap dispatches, cut host sync).
+- **The recurring "~100-step hang" ROOT-CAUSED (the supervisor was a dead end —
+  sawtooth, never progressed).** Systematic isolation: NOT validation (off in every
+  hang), NOT a memory leak (RSS flat), NOT MultiSteps (hangs without it), NOT a fixed
+  threshold (random iter 10–130), and NOT either custom kernel (flash & GEMM each ran
+  400 iters clean at the batched shapes). It's the **combined batched model graph
+  faulting the Metal HAL** — full fwd+bwd loop (no loader/opt/wandb) hangs ~iter 60.
+  Discriminator: **bs16 graph faults within ~60 iters; bs8 graph ran 400 clean** ⇒
+  it's the **per-graph working-set size** (bs16 ⇒ M=8192 GEMMs + 1.6 GB×3 logit/
+  one-hot/dlogit buffers stress the HAL; the old per-sequence 10k run had tiny
+  bs4/M=512 dispatches). **Fix (no supervisor): bs8 micro-batch (stable) +
+  MultiSteps ×4 ⇒ effective bs32** — same effective gradient, lr=1e-3 stable. Loss
+  run `comp_bs8x4` relaunched this way → _in progress_.
 
 ---
 
