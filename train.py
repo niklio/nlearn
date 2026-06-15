@@ -261,13 +261,23 @@ eval_batch_loss = jax.jit(batch_loss)
 # JIT-compiled loss without gradients — used for validation evaluation.
 
 
+# fp16 underflow guard (interim until bf16): scale the loss so small activations'
+# gradients stay representable through the fp16 backward, then unscale before the
+# optimizer update. Static scale — metal-spirv miscompiles lax.cond, so we don't do
+# dynamic overflow-skip; 2^10 is safely below fp16's 65504 max for this model.
+LOSS_SCALE = float(os.environ.get("NLEARN_LOSS_SCALE", "1024.0")) if _attn.USE_IREE_FLASH else 1.0
+
+
 def make_train_step(optimizer):
     """Returns a JIT-compiled train step closed over the given optimizer."""
     def train_step(params, opt_state, batch):
-        loss, grads = loss_and_grad_fn(params, batch)
+        scaled_loss, grads = jax.value_and_grad(
+            lambda p: batch_loss(p, batch) * LOSS_SCALE)(params)
+        if LOSS_SCALE != 1.0:
+            grads = jax.tree_util.tree_map(lambda g: g / LOSS_SCALE, grads)
         updates, opt_state = optimizer.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, loss
+        return params, opt_state, scaled_loss / LOSS_SCALE
     return jax.jit(train_step)
 # jax.jit (Just-In-Time compilation) transforms train_step into a compiled GPU program.
 # First call: JAX traces the function and compiles it to optimized GPU code (~5-10s).
