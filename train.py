@@ -271,32 +271,23 @@ eval_batch_loss = jax.jit(batch_loss)
 LOSS_SCALE = float(os.environ.get("NLEARN_LOSS_SCALE", "1.0"))
 
 
-# Gradient accumulation: NLEARN_GRAD_ACCUM micro-batches per optimizer step. Lets us
-# reach an effective batch (e.g. 32) larger than what one forward+backward fits in
-# 16 GB (bs16 is the single-pass ceiling — bs24+ OOMs in train_step). Each micro-grad
-# is computed and summed (Python-unrolled, no lax control flow), then one Adam update.
+# Gradient accumulation via optax.MultiSteps: NLEARN_GRAD_ACCUM micro-batches per
+# effective optimizer update. Each train_step processes ONE micro-batch (so peak
+# memory stays at micro-batch size — bs16 is the single-pass ceiling; bs24+ OOMs),
+# and MultiSteps accumulates across calls, applying the real Adam update every Kth.
+# This reaches an effective batch (e.g. 32 = 16×2) where lr=1e-3 is stable, without
+# the OOM of materialising K micro-graphs at once. K=1 ⇒ plain single-batch training.
 GRAD_ACCUM = int(os.environ.get("NLEARN_GRAD_ACCUM", "1"))
 
 
 def make_train_step(optimizer):
-    """Returns a JIT-compiled train step closed over the given optimizer."""
+    """Returns a JIT-compiled train step closed over the given optimizer (which may be
+    an optax.MultiSteps wrapper that accumulates K micro-batch grads before applying)."""
     def _scaled_loss(p, b):
         return batch_loss(p, b) * LOSS_SCALE
 
     def train_step(params, opt_state, batch):
-        if GRAD_ACCUM <= 1:
-            scaled_loss, grads = jax.value_and_grad(_scaled_loss)(params, batch)
-        else:
-            mb = batch.shape[0] // GRAD_ACCUM
-            scaled_loss = jnp.float32(0.0)
-            grads = None
-            for i in range(GRAD_ACCUM):
-                chunk = jax.lax.dynamic_slice_in_dim(batch, i * mb, mb, axis=0)
-                l, g = jax.value_and_grad(_scaled_loss)(params, chunk)
-                scaled_loss = scaled_loss + l
-                grads = g if grads is None else jax.tree_util.tree_map(jnp.add, grads, g)
-            scaled_loss = scaled_loss / GRAD_ACCUM
-            grads = jax.tree_util.tree_map(lambda x: x / GRAD_ACCUM, grads)
+        scaled_loss, grads = jax.value_and_grad(_scaled_loss)(params, batch)
         if LOSS_SCALE != 1.0:
             grads = jax.tree_util.tree_map(lambda g: g / LOSS_SCALE, grads)
         updates, opt_state = optimizer.update(grads, opt_state)
@@ -445,15 +436,23 @@ class StreamingLoader:
 
 def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEAK_LR,
           run_name=None, dataset="fineweb-edu"):
-    warmup = min(WARMUP_STEPS, steps // 5)
+    # With gradient accumulation (GRAD_ACCUM micro-steps per update), the LR schedule
+    # advances per EFFECTIVE update, so build it over steps//GRAD_ACCUM and run the
+    # loop for `steps` micro-steps. (GRAD_ACCUM=1 ⇒ unchanged.)
+    eff_updates = max(1, steps // GRAD_ACCUM)
+    warmup = min(WARMUP_STEPS, eff_updates // 5)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
         warmup_steps=warmup,
-        decay_steps=steps,
+        decay_steps=eff_updates,
         end_value=peak_lr / 10,
     )
     optimizer = optax.adam(learning_rate=schedule)
+    if GRAD_ACCUM > 1:
+        optimizer = optax.MultiSteps(optimizer, every_k_schedule=GRAD_ACCUM)
+        print(f"Gradient accumulation: {GRAD_ACCUM} micro-batches/update "
+              f"(effective batch {batch_size * GRAD_ACCUM}, {eff_updates} updates)")
     train_step = make_train_step(optimizer)
 
     dataset_cfg = DATASETS[dataset]
