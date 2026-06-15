@@ -14,8 +14,15 @@ wired into JAX (the custom_call → `flow.dispatch` compiler pass + `custom_vjp`
 # Competitive-performance roadmap (current objective)
 
 **Goal:** match the jax-metal reference run `dtjp60zy` (*pretty-monkey-41*) at the
-*same* architecture/batch — **val loss ≤ 5.71** with **MFU competitive to jax-metal
-(~68%)**. Autonomous, multi-day/week execution.
+*same* architecture/batch on **three axes**: **(1) val loss ≤ 5.71**, **(2) MFU
+competitive (~68%)**, and **(3) GPU utilization at parity** (GPU kept busy, not idle
+between dispatches — distinct from MFU). Autonomous, multi-day/week execution.
+
+**Measuring GPU utilization:** ground truth = `sudo powermetrics --samplers gpu_power`
+("GPU HW active residency"); accessible proxies = `ioreg -r -c IOAccelerator -d 1`
+→ "Device Utilization %" (graphics-biased, sample over time) and the
+**Σ(kernel GPU time) / step wall-time** ratio (from `iree-benchmark-module` per
+dispatch). Must measure jax-metal's util the same way for the parity number.
 
 ### Reference target (jax-metal, measured from W&B)
 
@@ -31,18 +38,24 @@ wired into JAX (the custom_call → `flow.dispatch` compiler pass + `custom_vjp`
 | step_time | 2.6 s (bs32) | ~2 s (bs4) → ~16 s (bs32, sequential) |
 | peak mem | 9.1 GB | 3 GB (bs4) |
 
-### Gap analysis (two independent problems)
+### Gap analysis (three problems)
 
 1. **Loss gap = batch size / LR.** dtjp60zy hit 5.68 in **1000 steps** because bs32
    makes gradients ~8× less noisy, so **peak_lr=1e-3 is stable** and converges fast.
    At bs4, 1e-3 *diverges* (proven) → forced to 3e-4 → plateau at 7.1. **Fix: bs32 +
    peak_lr=1e-3** (likely reproduces ~5.7 directly, if it fits in 16 GB).
-2. **MFU gap = dispatch batching (~6×).** Our custom GEMM does 2.4 TFLOPS *standalone*,
-   but the model runs under `vmap_method="sequential"`, so bs32 = 32 tiny separate
-   dispatches feeding small (512×512) GEMMs where overhead dominates → ~0.4 TFLOPS
-   end-to-end. jax-metal batches into single big ops (M=bs·seq=16384). **Fix: batched
-   execution — one big dispatch per op, not bs× sequential ones** (the deferred
-   "batch-aware dispatch" P1, now the central lever).
+2. **MFU gap.** Batched refactor (done) fixed the worst of this, but throughput is
+   FLAT ~0.6 TFLOPS across bs8/16 → the GEMM is inefficient at the model's small-K
+   shapes (K=512; it was tuned at K=2048). **Fix: re-tune the GEMM at the model's
+   real shapes.**
+3. **GPU-utilization gap (NEW axis).** Prelim: GPU appears idle most of each step
+   (`ioreg` Device Utilization ~6% time-averaged during a live step; needs
+   `powermetrics` confirmation) — consistent with the flat 0.6 TFLOPS being
+   *overhead/idle*-bound, not compute-bound. Suspects: many small runtime-compiled
+   dispatches with host sync/launch gaps between them, the MultiSteps host logic, and
+   per-step Python. **Fix: cut GPU idle — fuse/coalesce dispatches, overlap/async
+   submission, minimize host↔device sync, reduce per-step host overhead.** This
+   overlaps with the MFU work but is measured separately (busy-time, not FLOPS-eff).
 
 ### The linchpin
 
@@ -80,19 +93,25 @@ memory proves intractable.
   (c) **gradient accumulation** (bs8 micro ×4) as the fallback.
 - **Gate D2:** bs32 trains correctly within 16 GB (target ≈ 9 GB), loss decreasing.
 
-**Day 3 — Throughput / MFU.**
+**Day 3 — Throughput / MFU / GPU utilization.**
+- **Establish the GPU-util baseline & reference:** measure our step's
+  Σ(kernel GPU time)/wall-time and `powermetrics` residency; measure a short jax-metal
+  run the same way for the parity target.
 - Profile the bs32 step with `iree-benchmark-module` on the *real* shapes; attribute
-  time to GEMMs / flash / CE / overhead.
+  wall-time to GEMMs / flash / CE / **idle gaps & host overhead**.
 - Re-tune the GEMM at the model's shapes (M=16384, K/N ∈ {512, 2048, 50272}) — it was
   tuned at 2048³; sweep tile/BK there. Re-tune flash at `(bs·heads=256, seq=512, dh=64)`.
-- Cut dispatch overhead; fuse where cheap.
-- **Gate D3:** end-to-end **≥ ~1.5–2.4 TFLOPS, MFU ≥ ~60%, bs32 step ≤ ~3–4 s.**
+- **Cut GPU idle:** fuse/coalesce dispatches, overlap/async submission, minimize
+  host↔device sync, reduce per-step Python/MultiSteps host overhead.
+- **Gate D3:** end-to-end **≥ ~1.5–2.4 TFLOPS, MFU ≥ ~60%, GPU util at parity with
+  jax-metal, bs32 step competitive.**
 
 **Day 4 — Competitive run.**
 - Match the reference schedule (peak_lr **1e-3**, end_lr 1e-4, warmup 200); confirm
   1e-3 is stable at bs32 (reference says yes). Run **1000 steps**, monitor loss curve
   vs reference, MFU, mem; checkpoint every 1000 / cap val.
-- **Gate D4 (HEADLINE):** **val ≤ 5.71 at MFU competitive with jax-metal.**
+- **Gate D4 (HEADLINE):** **val ≤ 5.71 at MFU *and* GPU utilization competitive with
+  jax-metal** — the full three-axis verification on our drivers.
 
 **Day 5+ — Harden / surpass.**
 - If loss short: tune LR/warmup/init/optimizer to the reference exactly; longer run.
@@ -113,8 +132,9 @@ One experiment at a time; GPU-health check + `pkill` between runs (hung kernels 
 recovery time). Monitor via the unbuffered W&B `output.log` + CPU-advance stall
 detection (piped stdout is block-buffered — unreliable for liveness). Cap validation
 (`NLEARN_VAL_BATCHES`); checkpoint every 1000 steps; recover from latest checkpoint on
-hang/crash; watch LR divergence and OOM. Record every result (config → val, MFU, mem,
-step) in the log below; commit working changes; capture compiler edits as patches.
+hang/crash; watch LR divergence and OOM. Record every result (config → val, MFU,
+**GPU util**, mem, step) in the log below; commit working changes; capture compiler
+edits as patches.
 
 ### Results log
 - (baseline) bs4 / lr3e-4 / 10k → val ~7.1, MFU ~57%, ~0.4 TFLOPS  [run_10k_lr3e4]
@@ -135,8 +155,15 @@ step) in the log below; commit working changes; capture compiler edits as patche
 - **Throughput is FLAT ~0.6 TFLOPS across bs8/16** ⇒ the MFU gap (0.6 vs jax-metal
   2.4, ~4×) is **GEMM efficiency at the model's small-K shapes (K=512)**, not batch
   (the kernel was tuned at K=2048). ⇒ Day 3 = re-tune GEMM at model shapes.
-- Loss run: bs16 / lr1e-3 / ~2000 steps (token-matched to the ref's 1000×bs32) →
-  _in progress_. MFU (Day 3) + true-bs32 (MultiSteps/fused-CE) remain.
+- **bs16 / lr1e-3 DIVERGED** (val 7.7→9.2): lr=1e-3 only stable at the reference's
+  bs32 averaging. ⇒ true effective-bs32 required for the loss target.
+- **Effective bs32 via `optax.MultiSteps` (bs16×2) WORKS** (each step bs16 mem, 2.7 GB):
+  loss converging + stable (val 10.94→8.76 @ 50 updates, no divergence). Loss-target
+  run `competitive_effbs32` (lr1e-3, 1000 updates, token-matched) → _in progress_.
+- **GPU-utilization (3rd axis, NEW):** prelim `ioreg` Device Utilization ~6%
+  time-averaged during a live step → GPU likely idle-bound (overhead/dispatch gaps),
+  consistent with flat 0.6 TFLOPS. Needs `powermetrics` confirmation + jax-metal
+  reference. ⇒ Day 3 also reduces GPU idle (fuse/overlap dispatches, cut host sync).
 
 ---
 
