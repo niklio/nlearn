@@ -2,7 +2,7 @@
 
 ## Diagnostic (conclusive)
 
-IREE's `metal-spirv` matmul runs at **~0.8 TFLOPS on the M4** (vs ~teens-of-
+IREE's `metal-spirv` matmul runs at **~0.5 TFLOPS on the M3** (vs ~teens-of-
 TFLOPS peak). Root cause, confirmed:
 
 1. **IREE's Apple GPU target advertises no matrix ops** — `getAppleTargetDetails`
@@ -17,7 +17,7 @@ TFLOPS peak). Root cause, confirmed:
 from a hand-written MSL kernel bound through the custom-dispatch pass. (This
 re-confirms the roadmap framing.)
 
-## What "peak" actually is on this M4
+## What "peak" actually is on this M3
 
 Measured with **MLX** (Apple's own hand-tuned GEMM) on this machine, fp16 2048³:
 **~2.9 TFLOPS**. So the achievable matmul peak here is ~3 TFLOPS — **not** the
@@ -39,7 +39,19 @@ All numbers below are true device time via `iree-benchmark-module` (2048³ fp16)
 | simdgroup, scalar staging, BK=32 | ✅ | 1.6 | 55% |
 | + double-buffering | ✅ | 1.3 | (worse — halves occupancy) |
 | **+ vectorized (half4) staging, BK=64 (current)** | ✅ | **~2.4** | **84%** |
+| jax-metal (`jnp.matmul`, the old backend) | — | 2.8 | 97% |
 | MLX (achievable peak) | — | 2.9 | 100% |
+
+## vs jax-metal (the backend we migrated off)
+
+jax-metal's `jnp.matmul` hits **~2.8 TFLOPS** — basically MLX-peak, because it
+dispatches to Apple's hand-tuned GPU matmul (MPS). So **matmul was never jax-metal's
+weakness**; we left jax-metal because it *categorically cannot run custom kernels*
+(custom_call rejected at legalization → no FlashAttention; see
+`jax-metal-no-custom-call`). The cost of that move, for plain matmul, is the gap
+between Apple's library (2.8) and IREE's naive codegen (0.5); this custom kernel
+recovers most of it (→2.4, ~86% of jax-metal). The *payoff* — custom FlashAttention
+and other fused kernels — is impossible on jax-metal at any speed.
 
 Lessons baked into the kernel:
 - **Unroll loops over `simdgroup_matrix` arrays** — Metal can't dynamically index
@@ -58,7 +70,7 @@ Lessons baked into the kernel:
 ## Remaining gap / next steps
 
 - The last ~16% to MLX would need MLX-level micro-optimization (register-resident
-  output blocking, load/compute software pipelining tuned to the M4, swizzled
+  output blocking, load/compute software pipelining tuned to the M3, swizzled
   threadgroup layout to kill bank conflicts) — diminishing returns.
 - **Integration (the remaining piece of "solve #2"):** route the model's big
   matmuls (MLP, projections, lm_head) through this kernel via the dispatch pass —

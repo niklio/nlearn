@@ -16,13 +16,13 @@ wired into JAX (the custom_call → `flow.dispatch` compiler pass + `custom_vjp`
 **Goal:** train a long-context model as efficiently as possible on the Mac mini,
 writing new Metal kernels where needed to enable SoTA routines.
 
-**Hardware:** Apple **M4**, 10-core GPU, **16 GB** unified memory.
+**Hardware:** Apple **M3**, 10-core GPU, **16 GB** unified memory.
 
 **Two binding constraints (measured during the migration):**
 - **Memory** — 16 GB is shared by activations, params, optimizer state, and
   logits, so memory-saving routines matter as much as speed for long context.
 - **Matmul throughput** — IREE's `metal-spirv` codegen runs at **~0.5 TFLOPS**
-  (true device time). The achievable fp16 peak on this M4 is **~2.9 TFLOPS**
+  (true device time). The achievable fp16 peak on this M3 is **~2.9 TFLOPS**
   (measured with MLX, Apple's own tuned GEMM) — *not* the "teens" first assumed.
   Our custom `simdgroup_matrix` GEMM now hits **~2.4 TFLOPS (≈84% of MLX, ~4.8×
   naive)**; see [`iree_metal/kernels/GEMM.md`](iree_metal/kernels/GEMM.md).
@@ -64,7 +64,7 @@ add the target name to the pass, wire the VJP).
 - [ ] **Root-cause the Metal HAL runtime hang at high dispatch count.** Forced
   B=2; gates batch size and run length. Likely command-buffer/semaphore
   accumulation in IREE's Metal HAL. *Effort: medium–high, uncertain.*
-- [ ] **bf16 support in the `metal-spirv` target.** M4 supports bf16 in HW; IREE
+- [ ] **bf16 support in the `metal-spirv` target.** M3 supports bf16 in HW; IREE
   doesn't codegen it (forces fp16). bf16's wider range removes the need for loss
   scaling and reduces wasted long runs. *Effort: medium (compiler target).*
 - [ ] **fp16 dynamic loss scaling (interim, until bf16).** Guards against silent
