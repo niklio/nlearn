@@ -261,11 +261,13 @@ eval_batch_loss = jax.jit(batch_loss)
 # JIT-compiled loss without gradients — used for validation evaluation.
 
 
-# fp16 underflow guard (interim until bf16): scale the loss so small activations'
-# gradients stay representable through the fp16 backward, then unscale before the
-# optimizer update. Static scale — metal-spirv miscompiles lax.cond, so we don't do
-# dynamic overflow-skip; 2^10 is safely below fp16's 65504 max for this model.
-LOSS_SCALE = float(os.environ.get("NLEARN_LOSS_SCALE", "1024.0")) if _attn.USE_IREE_FLASH else 1.0
+# fp16 loss scaling. EMPIRICAL FINDING: this model trains stably in fp16 WITHOUT
+# scaling (no gradient underflow observed — loss falls cleanly to ~7.8), while a
+# STATIC scale overflows fp16 in the backward once gradients grow post-warmup and
+# produces NaN (caught by a 250-step validation run). Proper dynamic loss scaling
+# (back off on overflow) needs lax.cond, which metal-spirv miscompiles. So default
+# OFF; set NLEARN_LOSS_SCALE>1 manually only if underflow ever appears.
+LOSS_SCALE = float(os.environ.get("NLEARN_LOSS_SCALE", "1.0"))
 
 
 def make_train_step(optimizer):

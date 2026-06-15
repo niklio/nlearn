@@ -84,11 +84,15 @@ add the target name to the pass, wire the VJP).
   new lowering + spirv-cross→MSL support). Its purpose — wider dynamic range so loss
   scaling isn't needed — is covered by the interim below, which is now in place. Not
   a blocker for training; revisit if fp16+loss-scaling proves insufficient.
-- [x] **fp16 loss scaling (interim, until bf16).** *DONE.* Static scale (default
-  2^10, `NLEARN_LOSS_SCALE`) in `make_train_step`: scale the loss so small gradients
-  survive the fp16 backward, unscale before the optimizer update. Static (no
-  `lax.cond` overflow-skip — metal-spirv miscompiles control flow). Loss trajectory
-  unchanged; guards long runs against silent gradient underflow.
+- [x] **fp16 loss scaling (interim, until bf16).** *Done — and found unnecessary
+  for this model.* Implemented a static scale (`NLEARN_LOSS_SCALE`, unscale before
+  the optimizer step; no `lax.cond` overflow-skip since metal-spirv miscompiles
+  control flow). A 250-step validation run revealed the static scale (2^10) *causes*
+  NaN — it overflows fp16 in the backward once gradients grow post-warmup. Crucially
+  the model trains **stably in fp16 with no scaling** (no underflow; loss falls
+  cleanly to ~7.8 over 150 steps), so the default is now **off**; the knob remains
+  for manual use. Proper dynamic scaling (back off on overflow) would need lax.cond
+  → tied to the metal-spirv control-flow gap.
 
 ## P2 — memory headroom & instrumentation
 
