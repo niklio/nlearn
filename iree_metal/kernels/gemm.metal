@@ -34,7 +34,7 @@ struct GemmParams { uint M; uint N; uint K; };
 #define WN   16           // cols per simdgroup
 #define BM   (SG_M * WM)  // 32
 #define BN   (SG_N * WN)  // 32
-#define BK   32           // K-slab depth: thicker = fewer barriers, more compute/stage
+#define BK   64           // K-slab depth (swept: 64 best; 128+ loses occupancy)
 #define TM   (WM / 8)     // 2 — 8x8 tiles per simdgroup down M
 #define TN   (WN / 8)     // 2 — across N
 #define NTHREADS (SG_M * SG_N * 32)   // 128
@@ -62,14 +62,21 @@ kernel void gemm_sg(
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
-        // All NTHREADS cooperatively stage the shared A/B slabs.
-        for (uint e = tid; e < BM * BK; e += NTHREADS) {
-            uint r = e / BK, c = e % BK;
-            As[r][c] = args.A[(row0 + r) * p.K + (k0 + c)];
+        // Vectorized cooperative staging: each thread moves half4s (rows are
+        // contiguous in both global and the slab), so 1/4 the load instrs and no
+        // per-element div/mod. BK and BN are multiples of 4.
+        threadgroup half4* As4 = (threadgroup half4*)As;
+        threadgroup half4* Bs4 = (threadgroup half4*)Bs;
+        device const half4* A4 = (device const half4*)args.A;
+        device const half4* B4 = (device const half4*)args.B;
+        const uint Kq = p.K >> 2, Nq = p.N >> 2, BKq = BK >> 2, BNq = BN >> 2;
+        for (uint e = tid; e < BM * BKq; e += NTHREADS) {
+            uint r = e / BKq, c = e % BKq;
+            As4[r * BKq + c] = A4[(row0 + r) * Kq + (k0 >> 2) + c];
         }
-        for (uint e = tid; e < BK * BN; e += NTHREADS) {
-            uint r = e / BN, c = e % BN;
-            Bs[r][c] = args.B[(k0 + r) * p.N + (col0 + c)];
+        for (uint e = tid; e < BK * BNq; e += NTHREADS) {
+            uint r = e / BNq, c = e % BNq;
+            Bs4[r * BNq + c] = B4[(k0 + r) * Nq + (col0 >> 2) + c];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

@@ -21,8 +21,11 @@ writing new Metal kernels where needed to enable SoTA routines.
 **Two binding constraints (measured during the migration):**
 - **Memory** — 16 GB is shared by activations, params, optimizer state, and
   logits, so memory-saving routines matter as much as speed for long context.
-- **Matmul throughput** — benchmarked **~0.8 TFLOPS** vs the M4's ~teens-of-
-  TFLOPS fp16 peak; IREE's `metal-spirv` codegen leaves ~15–20× on the floor.
+- **Matmul throughput** — IREE's `metal-spirv` codegen runs at **~0.5 TFLOPS**
+  (true device time). The achievable fp16 peak on this M4 is **~2.9 TFLOPS**
+  (measured with MLX, Apple's own tuned GEMM) — *not* the "teens" first assumed.
+  Our custom `simdgroup_matrix` GEMM now hits **~2.4 TFLOPS (≈84% of MLX, ~4.8×
+  naive)**; see [`iree_metal/kernels/GEMM.md`](iree_metal/kernels/GEMM.md).
 
 **Enabler:** the custom-MSL-kernel → IREE `flow.dispatch` pass + `custom_vjp`
 binding is in place, so each new SoTA kernel is a repeatable pattern (author MSL,
@@ -38,11 +41,13 @@ add the target name to the pass, wire the VJP).
 - [~] **Custom Metal GEMM with `simdgroup_matrix`.** *Diagnostic done
   ([`iree_metal/kernels/GEMM.md`](iree_metal/kernels/GEMM.md)): not a flag — IREE's
   Apple target has `mmaCount=0` and spirv-cross can't emit `simdgroup_matrix`, so
-  a custom kernel is required.* A correct `simdgroup_matrix` GEMM
-  (`iree_metal/kernels/gemm.metal`) is built + validated but only ~0.94 TFLOPS
-  (single-simdgroup register ceiling). **Remaining:** multi-simdgroup tiled GEMM
-  (target ~8–10 TFLOPS) + integrate the model's big matmuls. *Impact: very high
-  (everything). Effort: medium–high.*
+  a custom kernel is required.* Kernel built, validated, and **optimized to ~2.4
+  TFLOPS** (multi-simdgroup, vectorized half4 staging, BK=64) — **≈84% of MLX's
+  ~2.9 TFLOPS peak, ~4.8× IREE naive**. Profiled with `iree-benchmark-module`;
+  occupancy (not bandwidth) is the limiter, staging vectorization was the big win.
+  **Remaining:** route the model's big matmuls (MLP, projections, lm_head) through
+  it via the dispatch pass + dim/transpose handling. *Impact: very high
+  (everything). Effort: medium (kernel done; integration left).*
 - [ ] **Fused cross-entropy kernel (online-softmax, no logit materialization).**
   The simple CE materializes the `(L × 50257)` logit matrix (~1.6 GB/seq at
   L=8k, ×batch ×fwd+bwd); the chunked CE that avoided it is broken on
