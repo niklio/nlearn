@@ -11,7 +11,77 @@ wired into JAX (the custom_call → `flow.dispatch` compiler pass + `custom_vjp`
 
 ---
 
-# Optimization roadmap
+# Competitive-performance roadmap (current objective)
+
+**Goal:** match the jax-metal reference run `dtjp60zy` (*pretty-monkey-41*) at the
+*same* architecture/batch — **val loss ≤ 5.71** with **MFU competitive to jax-metal
+(~68%)**. Autonomous, multi-day/week execution.
+
+### Reference target (jax-metal, measured from W&B)
+
+| metric | dtjp60zy (jax-metal) | our best so far |
+|---|---|---|
+| arch | d512 / 8h / 4L / seq512 / 64M | same |
+| batch_size | **32** | 4 |
+| steps | **1000** | 10000 |
+| peak_lr / warmup | **1e-3** / 200 | 3e-4 / 200 |
+| **val loss** | **5.71** | 7.1 |
+| **MFU** | **67.9%** | ~57% (vs naive peak) |
+| achieved throughput | **~2.4 TFLOPS** | **~0.4 TFLOPS** |
+| step_time | 2.6 s (bs32) | ~2 s (bs4) → ~16 s (bs32, sequential) |
+| peak mem | 9.1 GB | 3 GB (bs4) |
+
+### Gap analysis (two independent problems)
+
+1. **Loss gap = batch size / LR.** dtjp60zy hit 5.68 in **1000 steps** because bs32
+   makes gradients ~8× less noisy, so **peak_lr=1e-3 is stable** and converges fast.
+   At bs4, 1e-3 *diverges* (proven) → forced to 3e-4 → plateau at 7.1. **Fix: bs32 +
+   peak_lr=1e-3** (likely reproduces ~5.7 directly, if it fits in 16 GB).
+2. **MFU gap = dispatch batching (~6×).** Our custom GEMM does 2.4 TFLOPS *standalone*,
+   but the model runs under `vmap_method="sequential"`, so bs32 = 32 tiny separate
+   dispatches feeding small (512×512) GEMMs where overhead dominates → ~0.4 TFLOPS
+   end-to-end. jax-metal batches into single big ops (M=bs·seq=16384). **Fix: batched
+   execution — one big dispatch per op, not bs× sequential ones** (the deferred
+   "batch-aware dispatch" P1, now the central lever).
+
+### Phases
+
+- **Phase 0 — Reproduce the loss target (de-risk loss, ignore speed).** Run **bs32,
+  peak_lr=1e-3, 1000 steps** on the *current* stack (sequential, slow, if it fits).
+  *Milestone: val ≤ ~5.8.* Proves the loss is achievable on our kernels and isolates
+  loss from throughput. If it OOMs → Phase 1 first.
+- **Phase 1 — Memory for bs32 (if Phase 0 OOMs).** The `(bs, seq, vocab)` logits +
+  one-hot in `_simple_cross_entropy_loss` are ~3.3 GB *each* at bs32 (≈10 GB with
+  backward). Implement a **fused / online-softmax cross-entropy** (no full-logit-row
+  materialization). *Milestone: bs32 trains within 16 GB (~9 GB like the reference).*
+- **Phase 2 — Throughput / MFU (the central work; close the ~6× gap).** Move off
+  `vmap`-sequential to **batched execution** so kernels see big shapes:
+  (2a) flatten `(bs,seq,d)→(bs·seq,d)` → each matmul is ONE GEMM with M=16384;
+  (2b) one flash dispatch over `(bs·heads,seq,d)`; (2c) batched/fused CE;
+  (2d) re-tune kernels at the real model shapes (GEMM was tuned at 2048³).
+  *Milestone: end-to-end ≥ ~1.5–2.4 TFLOPS, MFU ≥ ~60%, bs32 step ≤ ~3–4 s.*
+- **Phase 3 — Competitive run.** Tune LR/schedule/optimizer to track the reference
+  curve; run the 1000-step (and longer) competitive run. *Milestone: **val ≤ 5.71 at
+  MFU competitive with jax-metal** — the headline deliverable.*
+- **Phase 4 — Surpass / scale (open-ended).** More tokens (loss < 5.6); larger
+  model/context; kernels toward MLX-level (register-blocked GEMM, FA-2 simdgroup
+  attention); bf16; KV-cache eval.
+
+### Autonomous execution protocol
+One experiment at a time; GPU-health check + `pkill` between runs (hung kernels need
+recovery time). Monitor via the unbuffered W&B `output.log` + CPU-advance stall
+detection (piped stdout is block-buffered — unreliable for liveness). Cap validation
+(`NLEARN_VAL_BATCHES`); checkpoint every 1000 steps; recover from latest checkpoint on
+hang/crash; watch LR divergence and OOM. Record every result (config → val, MFU, mem,
+step) in the log below; commit working changes; capture compiler edits as patches.
+
+### Results log
+- (baseline) bs4 / lr3e-4 / 10k → val ~7.1, MFU ~57%, ~0.4 TFLOPS  [run_10k_lr3e4]
+- Phase 0: bs32 / lr1e-3 / 1000 → _in progress_
+
+---
+
+# Optimization roadmap (foundational work — mostly done)
 
 **Goal:** train a long-context model as efficiently as possible on the Mac mini,
 writing new Metal kernels where needed to enable SoTA routines.
