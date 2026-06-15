@@ -93,13 +93,15 @@ def linear(x, W):
     This is the batched-execution path: leading dims (batch, seq, …) are flattened
     into the GEMM's M, so e.g. (bs, seq, d) @ (d, n) is a single dispatch with
     M = bs·seq (16384 at bs32/seq512) — where the simdgroup kernel is efficient —
-    instead of bs separate small GEMMs under vmap. Returns f32 (the kernel's
-    accumulate dtype), matching the old `matmul`/`@` path. Off IREE-Metal (or
-    non-2D W) → jnp.matmul.
+    instead of bs separate small GEMMs under vmap. The kernel accumulates in f32 but
+    we DOWNCAST the output to x's compute dtype (fp16): standard mixed precision that
+    halves activation/logit memory traffic + working set — speeds the elementwise/
+    idle part of the step AND shrinks the buffers that fault the Metal HAL at bs16.
+    Off IREE-Metal (or non-2D W) → jnp.matmul.
     """
     if USE_IREE_GEMM and getattr(x, "ndim", None) is not None and x.ndim >= 2 and W.ndim == 2:
         lead = x.shape[:-1]
         K = x.shape[-1]
-        y = gemm(x.reshape(-1, K), W)          # (prod(lead), N) f32
-        return y.reshape(*lead, W.shape[1])
+        y = gemm(x.reshape(-1, K), W)          # (prod(lead), N) f32 accumulate
+        return y.reshape(*lead, W.shape[1]).astype(x.dtype)   # -> fp16 (mixed precision)
     return jnp.matmul(x, W)

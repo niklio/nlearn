@@ -164,6 +164,19 @@ edits as patches.
   time-averaged during a live step → GPU likely idle-bound (overhead/dispatch gaps),
   consistent with flat 0.6 TFLOPS. Needs `powermetrics` confirmation + jax-metal
   reference. ⇒ Day 3 also reduces GPU idle (fuse/overlap dispatches, cut host sync).
+- **GPU-UTILIZATION investigation (now top priority per user).** True util needs
+  `sudo powermetrics` (unavailable to the agent — user can run
+  `sudo powermetrics --samplers gpu_power`); `ioreg` Device Utilization % is graphics-
+  biased (unreliable). Profiled the bs8 grad step (2250 ms) instead:
+  blocks=1624 ms, lm_head+CE=626 ms. GEMM is fine at most shapes (mlp/lm_head 2.0–2.4
+  TFLOPS) — only the small **proj 4096×512×512 = 0.58 TFLOPS**; gemms total only
+  ~130 ms. So the step is dominated by the **scalar flash backward (~600 ms)** + a
+  long tail of **small unfused elementwise/reshape/transpose dispatches** (IREE-Metal
+  doesn't fuse like jax-metal's XLA → GPU idles between many small dispatches). fp16
+  activations (linear→fp16) were speed-neutral ⇒ not memory-traffic-bound ⇒ it's
+  **dispatch/idle-bound**. **Levers (Day-3, reprioritized):** (1) FA-2 flash backward
+  on simdgroup_matrix (kills the ~600 ms scalar cost); (2) cut dispatch count / fuse
+  the elementwise+reshape tail; (3) get powermetrics busy% to quantify idle.
 - **The recurring "~100-step hang" ROOT-CAUSED (the supervisor was a dead end —
   sawtooth, never progressed).** Systematic isolation: NOT validation (off in every
   hang), NOT a memory leak (RSS flat), NOT MultiSteps (hangs without it), NOT a fixed
