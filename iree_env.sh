@@ -23,6 +23,9 @@ export IREE_PJRT_IREE_COMPILER_OPTIONS="--iree-llvmcpu-embedded-linker-path=$_VE
 # Absolute path to the hand-authored Metal FlashAttention kernel object.
 export NLEARN_FLASH_KERNEL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/iree_metal/kernels/flash_attention.metal"
 
+# Absolute path to the hand-authored Metal GEMM kernel object (custom_call @gemm).
+export NLEARN_GEMM_KERNEL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/iree_metal/kernels/gemm.metal"
+
 # Quieter logs (set to debug to see compiler/driver detail).
 export IREE_PJRT_LOG_LEVEL=error
 

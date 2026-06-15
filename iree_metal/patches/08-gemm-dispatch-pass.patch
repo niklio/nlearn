@@ -1,0 +1,267 @@
+diff --git a/compiler/plugins/input/StableHLO/Conversion/StableHLOCustomCalls.cpp b/compiler/plugins/input/StableHLO/Conversion/StableHLOCustomCalls.cpp
+index e7314c1..e0e83a3 100644
+--- a/compiler/plugins/input/StableHLO/Conversion/StableHLOCustomCalls.cpp
++++ b/compiler/plugins/input/StableHLO/Conversion/StableHLOCustomCalls.cpp
+@@ -12,23 +12,29 @@
+ #include "compiler/plugins/input/StableHLO/Conversion/Rewriters.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "mlir/Dialect/Arith/IR/Arith.h"
++#include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "mlir/Dialect/Linalg/IR/Linalg.h"
+ #include "mlir/Dialect/SCF/IR/SCF.h"
+ #include "mlir/Dialect/Tensor/IR/Tensor.h"
+ #include "mlir/IR/BuiltinTypes.h"
+ #include "mlir/IR/ImplicitLocOpBuilder.h"
++#include "mlir/IR/SymbolTable.h"
+ #include "mlir/IR/TypeUtilities.h"
+ #include "mlir/Interfaces/FunctionInterfaces.h"
++#include "mlir/Parser/Parser.h"
+ #include "mlir/Support/LogicalResult.h"
+ #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
++#include "llvm/Support/FormatVariadic.h"
+ #include "stablehlo/dialect/BroadcastUtils.h"
+ #include "stablehlo/dialect/StablehloOps.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ 
+ namespace mlir::iree_compiler::stablehlo {
+ 
+ #define GEN_PASS_DEF_LEGALIZESTABLEHLOCUSTOMCALLS
++#define GEN_PASS_DEF_CONVERTFLASHATTENTIONDISPATCH
+ #include "compiler/plugins/input/StableHLO/Conversion/Passes.h.inc"
+ 
+ namespace {
+@@ -261,5 +267,232 @@ struct LegalizeStableHLOCustomCalls final
+     }
+   }
+ };
++
++// ---------------------------------------------------------------------------
++// ConvertFlashAttentionDispatch: @flash_attention_* custom_call -> wrapper call
++// ---------------------------------------------------------------------------
++
++// The shared metal-spirv executable target key for the objects. A config-less
++// target is "generic of" any specific metal-msl-fb target
++// (ExecutableTargetAttr::isGenericOf short-circuits when either config is
++// empty), so the hand-authored object attaches regardless of the concrete
++// device target (e.g. the apple-m3 target that --iree-hal-target-device=metal
++// produces). Do NOT add a config dict here or it must match the device exactly.
++static std::string metalTargetStr() {
++  return R"(#hal.executable.target<"metal-spirv", "metal-msl-fb">)";
++}
++
++// Builds a module string defining an external-kernel wrapper function `fn`
++// (and its hal.executable.source `exe`) for one of the flash kernels,
++// specialized to (n, s, d). Mirrors the validated kernels/test/*.mlir.
++static std::string buildWrapperModule(StringRef target, StringRef exe,
++                                      StringRef fn, int64_t n, int64_t s,
++                                      int64_t d, StringRef kernelPath) {
++  std::string mt = metalTargetStr();
++  std::string t3 = llvm::formatv("tensor<{0}x{1}x{2}xf32>", n, s, d).str();
++  std::string t2 = llvm::formatv("tensor<{0}x{1}xf32>", n, s).str();
++  int64_t ns = n * s;
++
++  auto exportHeader = [&](StringRef entry, StringRef bindings) {
++    return llvm::formatv(
++        R"(  hal.executable.source private @{0} attributes {{
++    objects = #hal.executable.objects<{{{1} = [#hal.executable.object<{{path = "{4}"}>]}>
++  } {{
++    hal.executable.export public @{2} ordinal(0)
++        layout(#hal.pipeline.layout<constants = 3, bindings = [{3}]>)
++        count(%dev: !hal.device, %w: index) -> (index, index, index) {{
++      %x = affine.apply affine_map<()[s0] -> (s0 ceildiv 64)>()[%w]
++      %c1 = arith.constant 1 : index
++      hal.return %x, %c1, %c1 : index, index, index
++    } attributes {{workgroup_size = [64 : index, 1 : index, 1 : index]}
++  })",
++        exe, mt, entry, bindings, kernelPath)
++        .str();
++  };
++  std::string ro = "#hal.pipeline.binding<storage_buffer, ReadOnly>";
++  std::string rw = "#hal.pipeline.binding<storage_buffer>";
++
++  std::string consts = llvm::formatv(
++      "    %w = arith.constant {0} : index\n    %n = arith.constant {1} : i32\n"
++      "    %s = arith.constant {2} : i32\n    %d = arith.constant {3} : i32\n",
++      ns, n, s, d).str();
++
++  if (target == "flash_attention_fwd") {
++    std::string bindings = ro + ", " + ro + ", " + ro + ", " + rw + ", " + rw;
++    return llvm::formatv(
++        "module {{\n{0}\n"
++        "  func.func private @{1}(%Q: {2}, %K: {2}, %V: {2}) -> ({2}, {3}) {{\n{4}"
++        "    %O, %L = flow.dispatch @{5}::@flash_attention_fwd[%w](%n, %s, %d, %Q, %K, %V)"
++        " : (i32, i32, i32, {2}, {2}, {2}) -> ({2}, {3})\n"
++        "    return %O, %L : {2}, {3}\n  }\n}\n",
++        exportHeader("flash_attention_fwd", bindings), fn, t3, t2, consts, exe)
++        .str();
++  }
++  if (target == "flash_attention_bwd_dq") {
++    std::string bindings =
++        ro + ", " + ro + ", " + ro + ", " + ro + ", " + ro + ", " + ro + ", " + rw;
++    return llvm::formatv(
++        "module {{\n{0}\n"
++        "  func.func private @{1}(%Q: {2}, %K: {2}, %V: {2}, %dO: {2}, %L: {3}, %D: {3}) -> {2} {{\n{4}"
++        "    %dQ = flow.dispatch @{5}::@flash_attention_bwd_dq[%w](%n, %s, %d, %Q, %K, %V, %dO, %L, %D)"
++        " : (i32, i32, i32, {2}, {2}, {2}, {2}, {3}, {3}) -> {2}\n"
++        "    return %dQ : {2}\n  }\n}\n",
++        exportHeader("flash_attention_bwd_dq", bindings), fn, t3, t2, consts, exe)
++        .str();
++  }
++  // flash_attention_bwd_dkdv
++  std::string bindings = ro + ", " + ro + ", " + ro + ", " + ro + ", " + ro +
++                         ", " + ro + ", " + rw + ", " + rw;
++  return llvm::formatv(
++      "module {{\n{0}\n"
++      "  func.func private @{1}(%Q: {2}, %K: {2}, %V: {2}, %dO: {2}, %L: {3}, %D: {3}) -> ({2}, {2}) {{\n{4}"
++      "    %dK, %dV = flow.dispatch @{5}::@flash_attention_bwd_dkdv[%w](%n, %s, %d, %Q, %K, %V, %dO, %L, %D)"
++      " : (i32, i32, i32, {2}, {2}, {2}, {2}, {3}, {3}) -> ({2}, {2})\n"
++      "    return %dK, %dV : {2}, {2}\n  }\n}\n",
++      exportHeader("flash_attention_bwd_dkdv", bindings), fn, t3, t2, consts, exe)
++      .str();
++}
++
++// Builds a wrapper for the custom simdgroup_matrix GEMM (kernels/gemm.metal):
++// C[M,N] f32 = A[M,K] f16 @ B[K,N] f16. Mirrors kernels/test/gemm_test.mlir
++// (32x32 tile, 128-thread workgroup, count = ceildiv(N,32) x ceildiv(M,32)).
++static std::string buildGemmWrapper(StringRef exe, StringRef fn, int64_t M,
++                                    int64_t N, int64_t K, StringRef kernelPath) {
++  std::string mt = metalTargetStr();
++  std::string tA = llvm::formatv("tensor<{0}x{1}xf16>", M, K).str();
++  std::string tB = llvm::formatv("tensor<{0}x{1}xf16>", K, N).str();
++  std::string tC = llvm::formatv("tensor<{0}x{1}xf32>", M, N).str();
++  std::string ro = "#hal.pipeline.binding<storage_buffer, ReadOnly>";
++  std::string rw = "#hal.pipeline.binding<storage_buffer>";
++  return llvm::formatv(
++      R"(module {{
++  hal.executable.source private @{0} attributes {{
++    objects = #hal.executable.objects<{{{1} = [#hal.executable.object<{{path = "{2}"}>]}>
++  } {{
++    hal.executable.export public @gemm_sg ordinal(0)
++        layout(#hal.pipeline.layout<constants = 3, bindings = [{3}, {3}, {4}]>)
++        count(%dev: !hal.device, %wn: index, %wm: index) -> (index, index, index) {{
++      %x = affine.apply affine_map<()[s0] -> (s0 ceildiv 32)>()[%wn]
++      %y = affine.apply affine_map<()[s0] -> (s0 ceildiv 32)>()[%wm]
++      %c1 = arith.constant 1 : index
++      hal.return %x, %y, %c1 : index, index, index
++    } attributes {{workgroup_size = [128 : index, 1 : index, 1 : index]}
++  }
++  func.func private @{5}(%A: {6}, %B: {7}) -> {8} {{
++    %wn = arith.constant {9} : index
++    %wm = arith.constant {10} : index
++    %Mi = arith.constant {10} : i32
++    %Ni = arith.constant {9} : i32
++    %Ki = arith.constant {11} : i32
++    %C = flow.dispatch @{0}::@gemm_sg[%wn, %wm](%Mi, %Ni, %Ki, %A, %B) : (i32, i32, i32, {6}, {7}) -> {8}
++    return %C : {8}
++  }
++}
++)",
++      exe, mt, kernelPath, ro, rw, fn, tA, tB, tC, N, M, K)
++      .str();
++}
++
++struct ConvertFlashAttentionDispatch final
++    : impl::ConvertFlashAttentionDispatchBase<ConvertFlashAttentionDispatch> {
++  void runOnOperation() override {
++    ModuleOp module = getOperation();
++    MLIRContext *ctx = &getContext();
++
++    SmallVector<mlir::stablehlo::CustomCallOp> calls;
++    module.walk([&](mlir::stablehlo::CustomCallOp op) {
++      StringRef t = op.getCallTargetName();
++      if (t == "flash_attention_fwd" || t == "flash_attention_bwd_dq" ||
++          t == "flash_attention_bwd_dkdv" || t == "gemm")
++        calls.push_back(op);
++    });
++    if (calls.empty())
++      return;
++
++    SymbolTable symbolTable(module);
++    for (auto op : calls) {
++      StringRef target = op.getCallTargetName();
++
++      // ----- Custom GEMM: A[M,K] @ B[K,N] -> C[M,N] -----
++      if (target == "gemm") {
++        auto aTy = dyn_cast<RankedTensorType>(op.getOperand(0).getType());
++        auto bTy = dyn_cast<RankedTensorType>(op.getOperand(1).getType());
++        if (!aTy || !bTy || aTy.getRank() != 2 || bTy.getRank() != 2) {
++          op.emitError("gemm custom_call expects 2D A[M,K] and B[K,N]");
++          return signalPassFailure();
++        }
++        int64_t M = aTy.getDimSize(0), K = aTy.getDimSize(1),
++                N = bTy.getDimSize(1);
++        std::string suffix = llvm::formatv("gemm_{0}x{1}x{2}", M, N, K).str();
++        std::string fn = "__" + suffix, exe = "__exe_" + suffix;
++        if (!symbolTable.lookup(fn)) {
++          const char *envPath = std::getenv("NLEARN_GEMM_KERNEL_PATH");
++          StringRef kernelPath =
++              envPath ? StringRef(envPath) : StringRef("gemm.metal");
++          std::string wrapperStr = buildGemmWrapper(exe, fn, M, N, K, kernelPath);
++          auto wrapperMod = parseSourceString<ModuleOp>(wrapperStr, ctx);
++          if (!wrapperMod) {
++            op.emitError("failed to parse gemm wrapper module");
++            return signalPassFailure();
++          }
++          for (Operation &top : llvm::make_early_inc_range(
++                   wrapperMod->getBody()->getOperations())) {
++            Operation *cloned = top.clone();
++            module.getBody()->push_back(cloned);
++            if (auto sym = dyn_cast<SymbolOpInterface>(cloned))
++              symbolTable.insert(cloned);
++          }
++        }
++        OpBuilder b(op);
++        auto call = b.create<func::CallOp>(op.getLoc(), fn, op.getResultTypes(),
++                                           op.getOperands());
++        op.replaceAllUsesWith(call.getResults());
++        op.erase();
++        continue;
++      }
++
++      auto qTy = dyn_cast<RankedTensorType>(op.getOperand(0).getType());
++      if (!qTy || qTy.getRank() != 3) {
++        op.emitError("flash_attention custom_call expects 3D (n,s,d) operand 0");
++        return signalPassFailure();
++      }
++      int64_t n = qTy.getDimSize(0), s = qTy.getDimSize(1), d = qTy.getDimSize(2);
++      std::string suffix = llvm::formatv("{0}_{1}x{2}x{3}", target, n, s, d).str();
++      std::string fn = "__" + suffix;
++      std::string exe = "__exe_" + suffix;
++
++      if (!symbolTable.lookup(fn)) {
++        // Absolute path to the hand-authored MSL kernel object. Read from the
++        // environment so it isn't baked into the compiler; findFileInPaths
++        // resolves absolute paths directly (no --iree-hal-executable-object-
++        // search-path needed, which the PJRT plugin's flag parser rejects).
++        const char *envPath = std::getenv("NLEARN_FLASH_KERNEL_PATH");
++        StringRef kernelPath = envPath ? StringRef(envPath)
++                                       : StringRef("flash_attention.metal");
++        std::string wrapperStr =
++            buildWrapperModule(target, exe, fn, n, s, d, kernelPath);
++        auto wrapperMod = parseSourceString<ModuleOp>(wrapperStr, ctx);
++        if (!wrapperMod) {
++          op.emitError("failed to parse flash wrapper module");
++          return signalPassFailure();
++        }
++        // Clone the wrapper's top-level ops (executable + func) into the module.
++        for (Operation &top :
++             llvm::make_early_inc_range(wrapperMod->getBody()->getOperations())) {
++          Operation *cloned = top.clone();
++          module.getBody()->push_back(cloned);
++          if (auto sym = dyn_cast<SymbolOpInterface>(cloned))
++            symbolTable.insert(cloned);
++        }
++      }
++
++      OpBuilder b(op);
++      auto call = b.create<func::CallOp>(op.getLoc(), fn, op.getResultTypes(),
++                                         op.getOperands());
++      op.replaceAllUsesWith(call.getResults());
++      op.erase();
++    }
++  }
++};
+ } // namespace
+ } // namespace mlir::iree_compiler::stablehlo

@@ -1,3 +1,4 @@
+import os
 """
 logging_utils.py — Training metrics: timing, memory, validation, and formatting.
 
@@ -99,16 +100,25 @@ class TrainingLogger:
         self._flops_per_step = estimate_flops_per_step(n_params, seq_len, batch_size)
         self._hw_peak_flops = hw_peak_tflops * 1e12  # convert TFLOPS → FLOPS
 
-        # Tell W&B to also plot loss metrics against total_flops as x-axis.
-        wandb.define_metric("loss/total_flops")
-        wandb.define_metric("loss/by_flops/*", step_metric="loss/total_flops")
+        # Tell W&B to also plot loss metrics against cumulative TFLOP (a count of
+        # 10^12 ops, not the per-second rate) as x-axis.
+        wandb.define_metric("loss/total_tflop")
+        wandb.define_metric("loss/by_tflop/*", step_metric="loss/total_tflop")
 
 
     def _compute_val_loss(self, params):
+        if os.environ.get("NLEARN_NO_VAL") == "1":   # diagnostic: skip validation
+            return float('nan')
+        # Cap the number of validation batches. Evaluating the *entire* held-out
+        # set (~100k tokens => ~100+ forward passes at seq=512) in one shot trips
+        # the IREE Metal HAL accumulation hang at seq>=256; a small sample gives a
+        # stable estimate and keeps the dispatch/allocation volume bounded.
+        max_batches = int(os.environ.get("NLEARN_VAL_BATCHES", "20"))
         val_losses = []
         for vb in self._val_batches_fn():
-            vl = self._eval_loss_fn(params, vb)
-            val_losses.append(float(vl))
+            val_losses.append(float(self._eval_loss_fn(params, vb)))
+            if len(val_losses) >= max_batches:
+                break
         return sum(val_losses) / len(val_losses) if val_losses else float('nan')
 
     def log_step(self, step, loss, timer, params, n_steps):
@@ -117,10 +127,13 @@ class TrainingLogger:
         self._total_flops += self._flops_per_step
         mem_mb = get_peak_memory_mb()
 
-        # MFU: fraction of hardware peak FLOPS used for model math
+        # Achieved throughput and MFU (fraction of hardware peak used for model math)
+        tflops = 0.0
         mfu = 0.0
-        if self._hw_peak_flops > 0 and timer.train_time > 0:
-            mfu = self._flops_per_step / (self._hw_peak_flops * timer.train_time)
+        if timer.train_time > 0:
+            tflops = self._flops_per_step / timer.train_time / 1e12
+            if self._hw_peak_flops > 0:
+                mfu = self._flops_per_step / (self._hw_peak_flops * timer.train_time)
 
         metrics = {
             "loss/train": float(loss),
@@ -128,28 +141,29 @@ class TrainingLogger:
             "hardware/data_time": timer.data_time,
             "hardware/train_time": timer.train_time,
             "hardware/peak_memory_mb": mem_mb,
+            "hardware/tflops": tflops,
             "hardware/mfu": mfu,
-            "loss/total_flops": self._total_flops,
+            "loss/total_tflop": self._total_flops / 1e12,
         }
 
-        # Loss indexed by FLOPs (live-updating chart)
-        metrics["loss/by_flops/train"] = float(loss)
+        # Loss indexed by cumulative TFLOP (live-updating chart)
+        metrics["loss/by_tflop/train"] = float(loss)
 
         # Periodic validation
         do_val = (step % self._val_every == 0)
         if do_val:
             val_loss = self._compute_val_loss(params)
             metrics["loss/val"] = val_loss
-            metrics["loss/by_flops/val"] = val_loss
+            metrics["loss/by_tflop/val"] = val_loss
 
         # Print to console
         if do_val:
             print(f"Step {step:>4}  loss: {loss:.4f}  val_loss: {val_loss:.4f}  "
-                  f"mfu: {mfu:.1%}  mem: {mem_mb:.0f}MB  "
+                  f"tflops: {tflops:.2f}  mfu: {mfu:.1%}  mem: {mem_mb:.0f}MB  "
                   f"step: {timer.step_time:.2f}s "
                   f"(data: {timer.data_time:.3f}s  train: {timer.train_time:.2f}s)")
         elif step % 100 == 0 or step < 5:
-            print(f"Step {step:>4}  loss: {loss:.4f}  mfu: {mfu:.1%}  mem: {mem_mb:.0f}MB  "
+            print(f"Step {step:>4}  loss: {loss:.4f}  tflops: {tflops:.2f}  mfu: {mfu:.1%}  mem: {mem_mb:.0f}MB  "
                   f"step: {timer.step_time:.2f}s "
                   f"(data: {timer.data_time:.3f}s  train: {timer.train_time:.2f}s)")
 
@@ -161,4 +175,4 @@ class TrainingLogger:
         avg = sum(self._step_times[1:]) / max(len(self._step_times) - 1, 1)
         print(f"\nTraining complete. Final loss: {loss:.4f}")
         print(f"Avg step time: {avg:.2f}s (excluding first step JIT)")
-        print(f"Total FLOPs: {self._total_flops:.2e}\n")
+        print(f"Total TFLOP: {self._total_flops / 1e12:.2f}\n")

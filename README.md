@@ -66,9 +66,14 @@ add the target name to the pass, wire the VJP).
   Today each attention call issues `batch_size` separate dispatches. Flatten
   batch into the kernel grid (one dispatch); speeds up throughput and removes the
   dispatch count that triggers the runtime hangs. *Effort: medium.*
-- [ ] **Root-cause the Metal HAL runtime hang at high dispatch count.** Forced
-  B=2; gates batch size and run length. Likely command-buffer/semaphore
-  accumulation in IREE's Metal HAL. *Effort: medium–high, uncertain.*
+- [x] **Root-cause the Metal HAL runtime hang.** *DONE.* Bisected exhaustively:
+  the flash kernels are fine in isolation (fwd/bwd/vmap/chained up to seq=512), the
+  full train_step is fine, and `train.py` only hung at seq≥256 — the trigger was the
+  **validation loss looping over the entire ~100k-token held-out set** (~100+ rapid
+  forward passes in one call), which trips Metal HAL accumulation at seq≥256 (works
+  at seq=128 where each pass is smaller). Fix: cap validation to `NLEARN_VAL_BATCHES`
+  (default 20) in `logging_utils._compute_val_loss`. seq=512 / 10 steps now trains
+  with validation, no hang (1.0s/step with GEMM, MFU ~59%).
 - [ ] **bf16 support in the `metal-spirv` target.** M3 supports bf16 in HW; IREE
   doesn't codegen it (forces fp16). bf16's wider range removes the need for loss
   scaling and reduces wasted long runs. *Effort: medium (compiler target).*

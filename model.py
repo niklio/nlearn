@@ -5,6 +5,7 @@ import jax.numpy as jnp              # JAX's version of NumPy — same API but r
 from jax import random               # JAX's random number module (different from Python's random — must pass keys explicitly)
 
 from attention import attention, PLATFORM  # Cross-platform attention dispatch (see attention.py)
+from gemm_iree import matmul as gemm_matmul  # custom Metal GEMM on IREE-Metal, else jnp.matmul
 
 # ---------------------------------------------------------------------------
 # HYPERPARAMETERS
@@ -142,14 +143,14 @@ def attention_forward(params, x):
     seq_len, _ = x.shape
     d_head = D_MODEL // N_HEADS
 
-    Q = (x @ params['W_q']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
-    K = (x @ params['W_k']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
-    V = (x @ params['W_v']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
+    Q = gemm_matmul(x, params['W_q']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
+    K = gemm_matmul(x, params['W_k']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
+    V = gemm_matmul(x, params['W_v']).reshape(seq_len, N_HEADS, d_head).transpose(1, 0, 2)
     # All: (N_HEADS, seq_len, d_head)
 
     out     = attention(Q, K, V)                            # (N_HEADS, seq_len, d_head)
     out     = out.transpose(1, 0, 2).reshape(seq_len, D_MODEL)
-    return out @ params['W_o']
+    return gemm_matmul(out, params['W_o'])
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +251,7 @@ def ffn_forward(params, x):
     x: shape (seq_len, D_MODEL)
     Returns same shape.
     """
-    x = x @ params['W1'] + params['b1']
+    x = gemm_matmul(x, params['W1']) + params['b1']
     # Linear projection: (seq_len, 128) @ (128, 512) + (512,) → (seq_len, 512)
     # Each token is now represented in a 512-dimensional space.
 
@@ -260,7 +261,7 @@ def ffn_forward(params, x):
     # Used by GPT-2, GPT-3, and most modern LLMs.
     # Without a non-linearity here, two linear layers would collapse into one — no extra power.
 
-    x = x @ params['W2'] + params['b2']
+    x = gemm_matmul(x, params['W2']) + params['b2']
     # Project back down: (seq_len, 512) @ (512, 128) + (128,) → (seq_len, D_MODEL)
     # Each token is back to its original D_MODEL size, but transformed.
 
@@ -362,8 +363,13 @@ def model_forward_features(params, token_ids):
         params,
     )
     x = embed(bf16_params['embeddings'], token_ids)
+    # NLEARN_NO_CHECKPOINT=1 disables remat (diagnostic: does remat-wrapping the
+    # flash custom_vjp trigger the seq>=256 hang on metal-spirv?).
+    import os as _os
+    _block = block_forward if _os.environ.get("NLEARN_NO_CHECKPOINT") == "1" \
+        else jax.checkpoint(block_forward, prevent_cse=False)
     for block_params in bf16_params['blocks']:
-        x = jax.checkpoint(block_forward, prevent_cse=False)(block_params, x)
+        x = _block(block_params, x)
     # Cast back to float32 for the final layer norm and loss computation.
     return layer_norm(params['ln_final'], x.astype(jnp.float32))
 
@@ -377,7 +383,9 @@ def model_forward(params, token_ids):
                logits[i] = scores for what token comes after position i
     """
     x = model_forward_features(params, token_ids)
-    return x @ params['lm_head']
+    # lm_head is the single biggest matmul (D_MODEL x VOCAB); route it through the
+    # custom Metal GEMM kernel on IREE-Metal (gemm_matmul falls back to @ elsewhere).
+    return gemm_matmul(x, params['lm_head'])
 
 
 # ---------------------------------------------------------------------------
