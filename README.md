@@ -125,7 +125,18 @@ step) in the log below; commit working changes; capture compiler edits as patche
   `(bs·seq, d)` in one dispatch; flash loops per-"head" ⇒ `(bs·heads, seq, d)` in one
   dispatch). **Phase 2 = model/train refactor to batched execution** (drop
   vmap-sequential), which fixes miscompile + memory-shape + MFU at once.
-- Phase 2: batched-execution refactor → _in progress_
+- **Phase 2 batched refactor DONE (Day 1):** correct + 2× faster. bs8 batched: loss
+  sane, **MFU 31%→90%** (vs naive peak), 0.64 TFLOPS (was 0.4), 2.5 s/step. Single
+  big GEMMs replace per-sequence dispatches.
+- **Day 2 findings:** batched bs8/16 train fully; **bs16 is the single-pass ceiling**
+  (bs24 grad fits but the full train_step OOMs on Adam state; bs32 OOMs — the
+  lm_head+CE materializes ~4–5×3.3 GB buffers). True bs32 ⇒ needs `optax.MultiSteps`
+  (manual grad-accum OOMs: both micro-graphs stay live) or a fused-CE kernel.
+- **Throughput is FLAT ~0.6 TFLOPS across bs8/16** ⇒ the MFU gap (0.6 vs jax-metal
+  2.4, ~4×) is **GEMM efficiency at the model's small-K shapes (K=512)**, not batch
+  (the kernel was tuned at K=2048). ⇒ Day 3 = re-tune GEMM at model shapes.
+- Loss run: bs16 / lr1e-3 / ~2000 steps (token-matched to the ref's 1000×bs32) →
+  _in progress_. MFU (Day 3) + true-bs32 (MultiSteps/fused-CE) remain.
 
 ---
 

@@ -271,11 +271,32 @@ eval_batch_loss = jax.jit(batch_loss)
 LOSS_SCALE = float(os.environ.get("NLEARN_LOSS_SCALE", "1.0"))
 
 
+# Gradient accumulation: NLEARN_GRAD_ACCUM micro-batches per optimizer step. Lets us
+# reach an effective batch (e.g. 32) larger than what one forward+backward fits in
+# 16 GB (bs16 is the single-pass ceiling — bs24+ OOMs in train_step). Each micro-grad
+# is computed and summed (Python-unrolled, no lax control flow), then one Adam update.
+GRAD_ACCUM = int(os.environ.get("NLEARN_GRAD_ACCUM", "1"))
+
+
 def make_train_step(optimizer):
     """Returns a JIT-compiled train step closed over the given optimizer."""
+    def _scaled_loss(p, b):
+        return batch_loss(p, b) * LOSS_SCALE
+
     def train_step(params, opt_state, batch):
-        scaled_loss, grads = jax.value_and_grad(
-            lambda p: batch_loss(p, batch) * LOSS_SCALE)(params)
+        if GRAD_ACCUM <= 1:
+            scaled_loss, grads = jax.value_and_grad(_scaled_loss)(params, batch)
+        else:
+            mb = batch.shape[0] // GRAD_ACCUM
+            scaled_loss = jnp.float32(0.0)
+            grads = None
+            for i in range(GRAD_ACCUM):
+                chunk = jax.lax.dynamic_slice_in_dim(batch, i * mb, mb, axis=0)
+                l, g = jax.value_and_grad(_scaled_loss)(params, chunk)
+                scaled_loss = scaled_loss + l
+                grads = g if grads is None else jax.tree_util.tree_map(jnp.add, grads, g)
+            scaled_loss = scaled_loss / GRAD_ACCUM
+            grads = jax.tree_util.tree_map(lambda x: x / GRAD_ACCUM, grads)
         if LOSS_SCALE != 1.0:
             grads = jax.tree_util.tree_map(lambda g: g / LOSS_SCALE, grads)
         updates, opt_state = optimizer.update(grads, opt_state)
