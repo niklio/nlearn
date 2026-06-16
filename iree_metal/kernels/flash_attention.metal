@@ -20,6 +20,7 @@ using namespace metal;
                         // registers. Requires d_head <= 64.
 #define MAX_DHEAD4 16   // MAX_DHEAD / 4 (float4 lanes)
 #define TG_SIZE_X 64u   // must match each export's workgroup_size
+#define DKV_QTILE 32u   // bwd_dkdv: query rows staged in threadgroup mem per tile
 
 struct PushConstants {
   uint n_heads;
@@ -108,11 +109,16 @@ kernel void flash_attention_bwd_dq(
     const float scale = 1.0f / sqrt((float)d);
     const uint head_off = h * p.seq_len * d;
 
-    // float4-vectorized: the inner loop streams K[j]/V[j] from global for every j;
-    // float4 loads cut load instructions 4× (the streamed reads dominate the backward).
+    // Tiled (mirror of bwd_dkdv): the 64 query-threads of this head-aligned block all
+    // loop over overlapping keys, so stage K/V key-tiles in threadgroup memory and
+    // reuse across the 64 queries — ~64× less global traffic. Requires seq_len%64==0.
+    threadgroup float4 Kt[DKV_QTILE][MAX_DHEAD4];
+    threadgroup float4 Vt[DKV_QTILE][MAX_DHEAD4];
+
     const uint nq = d >> 2;                          // float4 lanes (d % 4 == 0)
     const uint hoff4 = head_off >> 2;
     const uint i_off4 = hoff4 + i * nq;
+    const uint ib = (wgid.x * TG_SIZE_X) % p.seq_len; // first query of this head block
     device const float4* Q4  = (device const float4*)args.Q;
     device const float4* K4  = (device const float4*)args.K;
     device const float4* V4  = (device const float4*)args.V;
@@ -122,15 +128,25 @@ kernel void flash_attention_bwd_dq(
     const float Li = args.L[h * p.seq_len + i];
     const float Di = args.D[h * p.seq_len + i];
 
-    for (uint j = 0; j <= i; ++j) {                 // causal j<=i
-        const uint j_off4 = hoff4 + j * nq;
-        float s = 0.0f;
-        for (uint e = 0; e < nq; ++e) s += dot(qreg[e], K4[j_off4 + e]);
-        const float pij = exp(s * scale - Li);
-        float dp = 0.0f;
-        for (uint e = 0; e < nq; ++e) dp += dot(doreg[e], V4[j_off4 + e]);
-        const float ds = pij * (dp - Di);
-        for (uint e = 0; e < nq; ++e) dq[e] += scale * ds * K4[j_off4 + e];
+    for (uint kb = 0; kb < ib + TG_SIZE_X; kb += DKV_QTILE) {   // keys j<=max query (ib+63)
+        for (uint e = lid.x; e < DKV_QTILE * nq; e += TG_SIZE_X) {
+            uint r = e / nq, c = e % nq, kj = kb + r;
+            Kt[r][c] = K4[hoff4 + kj * nq + c];
+            Vt[r][c] = V4[hoff4 + kj * nq + c];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < DKV_QTILE; ++kk) {
+            if (kb + kk > i) break;                 // causal j<=i (keys ascending)
+            float s = 0.0f;
+            for (uint e = 0; e < nq; ++e) s += dot(qreg[e], Kt[kk][e]);
+            const float pij = exp(s * scale - Li);
+            float dp = 0.0f;
+            for (uint e = 0; e < nq; ++e) dp += dot(doreg[e], Vt[kk][e]);
+            const float ds = pij * (dp - Di);
+            for (uint e = 0; e < nq; ++e) dq[e] += scale * ds * Kt[kk][e];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     device float4* dQ4 = (device float4*)args.dQ;
     for (uint e = 0; e < nq; ++e) dQ4[i_off4 + e] = dq[e];
@@ -163,10 +179,20 @@ kernel void flash_attention_bwd_dkdv(
     const float scale = 1.0f / sqrt((float)d);
     const uint head_off = h * p.seq_len * d;
 
-    // float4-vectorized: the inner loop streams Q[i]/dO[i] from global for every i.
+    // Tiled: the 64 key-threads of this (head-aligned) block all loop over the SAME
+    // queries, so stage Q/dO query-tiles in threadgroup memory and reuse across the 64
+    // keys — ~64× less global traffic than each thread streaming Q[i]/dO[i] itself.
+    // Requires seq_len % 64 == 0 (head-aligned 64-key blocks) — guaranteed by the model
+    // (and the dispatch's 1D 64-blocks). float4 throughout.
+    threadgroup float4 Qt[DKV_QTILE][MAX_DHEAD4];
+    threadgroup float4 dOt[DKV_QTILE][MAX_DHEAD4];
+    threadgroup float  Lt[DKV_QTILE], Dt[DKV_QTILE];
+
     const uint nq = d >> 2;                          // float4 lanes (d % 4 == 0)
     const uint hoff4 = head_off >> 2;
     const uint j_off4 = hoff4 + j * nq;
+    const uint jb = (wgid.x * TG_SIZE_X) % p.seq_len; // first key of this head-aligned block
+    const uint lrow = h * p.seq_len;
     device const float4* Q4  = (device const float4*)args.Q;
     device const float4* K4  = (device const float4*)args.K;
     device const float4* V4  = (device const float4*)args.V;
@@ -174,20 +200,29 @@ kernel void flash_attention_bwd_dkdv(
     float4 kreg[MAX_DHEAD4], vreg[MAX_DHEAD4], dk[MAX_DHEAD4], dv[MAX_DHEAD4];
     for (uint e = 0; e < nq; ++e) { kreg[e] = K4[j_off4 + e]; vreg[e] = V4[j_off4 + e]; dk[e] = float4(0.0f); dv[e] = float4(0.0f); }
 
-    for (uint i = j; i < p.seq_len; ++i) {          // causal i>=j
-        const uint i_off4 = hoff4 + i * nq;
-        const float Li = args.L[h * p.seq_len + i];
-        const float Di = args.D[h * p.seq_len + i];
-        float s = 0.0f;
-        for (uint e = 0; e < nq; ++e) s += dot(Q4[i_off4 + e], kreg[e]);
-        const float pij = exp(s * scale - Li);
-        float dp = 0.0f;
-        for (uint e = 0; e < nq; ++e) dp += dot(dO4[i_off4 + e], vreg[e]);
-        const float ds = pij * (dp - Di);
-        for (uint e = 0; e < nq; ++e) {
-            dv[e] += pij * dO4[i_off4 + e];
-            dk[e] += scale * ds * Q4[i_off4 + e];
+    for (uint qb = jb; qb < p.seq_len; qb += DKV_QTILE) {   // queries i>=jb (block min key)
+        for (uint e = lid.x; e < DKV_QTILE * nq; e += TG_SIZE_X) {
+            uint r = e / nq, c = e % nq, qi = qb + r;
+            Qt[r][c]  = Q4[hoff4 + qi * nq + c];
+            dOt[r][c] = dO4[hoff4 + qi * nq + c];
         }
+        for (uint r = lid.x; r < DKV_QTILE; r += TG_SIZE_X) { Lt[r] = args.L[lrow + qb + r]; Dt[r] = args.D[lrow + qb + r]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ii = 0; ii < DKV_QTILE; ++ii) {
+            if (qb + ii < j) continue;              // causal i>=j
+            float s = 0.0f;
+            for (uint e = 0; e < nq; ++e) s += dot(Qt[ii][e], kreg[e]);
+            const float pij = exp(s * scale - Lt[ii]);
+            float dp = 0.0f;
+            for (uint e = 0; e < nq; ++e) dp += dot(dOt[ii][e], vreg[e]);
+            const float ds = pij * (dp - Dt[ii]);
+            for (uint e = 0; e < nq; ++e) {
+                dv[e] += pij * dOt[ii][e];
+                dk[e] += scale * ds * Qt[ii][e];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     device float4* dK4 = (device float4*)args.dK;
     device float4* dV4 = (device float4*)args.dV;
