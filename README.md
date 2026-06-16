@@ -177,6 +177,13 @@ edits as patches.
   **dispatch/idle-bound**. **Levers (Day-3, reprioritized):** (1) FA-2 flash backward
   on simdgroup_matrix (kills the ~600 ms scalar cost); (2) cut dispatch count / fuse
   the elementwise+reshape tail; (3) get powermetrics busy% to quantify idle.
+- **GPU-util/throughput WIN — tiled flash backward.** The scalar flash backward was
+  the bottleneck (54% of step, 0.03 TFLOPS, memory-bound: 64 threads/block re-read the
+  same Q/dO or K/V ~64× from global). Staged those into threadgroup memory (reuse
+  across the block): flash fwd+bwd **313→86.5 ms (3.6×)**, correct; **end-to-end bs8
+  step 2250→1288 ms, 0.5→1.23 TFLOPS (~half of jax-metal's 2.4, was 1/5).** Next
+  biggest chunk is now lm_head+CE (~49% of the step). (Backward requires seq%64; model
+  uses 512.)
 - **The recurring "~100-step hang" ROOT-CAUSED (the supervisor was a dead end —
   sawtooth, never progressed).** Systematic isolation: NOT validation (off in every
   hang), NOT a memory leak (RSS flat), NOT MultiSteps (hangs without it), NOT a fixed
