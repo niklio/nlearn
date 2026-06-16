@@ -222,7 +222,7 @@ def cross_entropy_loss(params, token_ids):
 # ---------------------------------------------------------------------------
 
 N_STEPS      = 5000    # Total training steps.
-WARMUP_STEPS = 200     # Ramp up LR over the first 200 steps (~4% of training).
+WARMUP_STEPS = int(os.environ.get("NLEARN_WARMUP", "200"))  # LR-ramp steps (effective updates)
 PEAK_LR      = 3e-4    # Peak learning rate. (1e-3 diverges in the fp16/IREE-Metal
                        # setup: a 10k-step B=4 run peaked at val 7.5 by step 200 then
                        # slowly climbed to 8.5 — gradual divergence, not NaN. 3e-4
