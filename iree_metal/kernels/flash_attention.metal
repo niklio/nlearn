@@ -14,8 +14,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define MAX_DHEAD 128
-#define MAX_DHEAD4 32   // MAX_DHEAD / 4 (float4 lanes)
+#define MAX_DHEAD 64    // d_head (model uses 64). Sized tight: the backward kernels
+                        // hold 3-4 per-thread arrays of this length; at 128 they spill
+                        // the register file (~0.03 TFLOPS scalar bwd); 64 keeps them in
+                        // registers. Requires d_head <= 64.
+#define MAX_DHEAD4 16   // MAX_DHEAD / 4 (float4 lanes)
 #define TG_SIZE_X 64u   // must match each export's workgroup_size
 
 struct PushConstants {
@@ -104,27 +107,33 @@ kernel void flash_attention_bwd_dq(
     const uint h = g / p.seq_len, i = g % p.seq_len, d = p.d_head;
     const float scale = 1.0f / sqrt((float)d);
     const uint head_off = h * p.seq_len * d;
-    const uint i_off = head_off + i * d;
 
-    // (Scalar: vectorizing this kernel gave no speedup — it's register/occupancy-
-    // bound on the per-thread q/dO/dq arrays, not load-width bound. Only the
-    // forward benefits from float4 loads.)
-    float qreg[MAX_DHEAD], doreg[MAX_DHEAD], dq[MAX_DHEAD];
-    for (uint e = 0; e < d; ++e) { qreg[e] = args.Q[i_off + e]; doreg[e] = args.dO[i_off + e]; dq[e] = 0.0f; }
+    // float4-vectorized: the inner loop streams K[j]/V[j] from global for every j;
+    // float4 loads cut load instructions 4× (the streamed reads dominate the backward).
+    const uint nq = d >> 2;                          // float4 lanes (d % 4 == 0)
+    const uint hoff4 = head_off >> 2;
+    const uint i_off4 = hoff4 + i * nq;
+    device const float4* Q4  = (device const float4*)args.Q;
+    device const float4* K4  = (device const float4*)args.K;
+    device const float4* V4  = (device const float4*)args.V;
+    device const float4* dO4 = (device const float4*)args.dO;
+    float4 qreg[MAX_DHEAD4], doreg[MAX_DHEAD4], dq[MAX_DHEAD4];
+    for (uint e = 0; e < nq; ++e) { qreg[e] = Q4[i_off4 + e]; doreg[e] = dO4[i_off4 + e]; dq[e] = float4(0.0f); }
     const float Li = args.L[h * p.seq_len + i];
     const float Di = args.D[h * p.seq_len + i];
 
     for (uint j = 0; j <= i; ++j) {                 // causal j<=i
-        const uint j_off = head_off + j * d;
+        const uint j_off4 = hoff4 + j * nq;
         float s = 0.0f;
-        for (uint e = 0; e < d; ++e) s += qreg[e] * args.K[j_off + e];
+        for (uint e = 0; e < nq; ++e) s += dot(qreg[e], K4[j_off4 + e]);
         const float pij = exp(s * scale - Li);
         float dp = 0.0f;
-        for (uint e = 0; e < d; ++e) dp += doreg[e] * args.V[j_off + e];
+        for (uint e = 0; e < nq; ++e) dp += dot(doreg[e], V4[j_off4 + e]);
         const float ds = pij * (dp - Di);
-        for (uint e = 0; e < d; ++e) dq[e] += scale * ds * args.K[j_off + e];
+        for (uint e = 0; e < nq; ++e) dq[e] += scale * ds * K4[j_off4 + e];
     }
-    for (uint e = 0; e < d; ++e) args.dQ[i_off + e] = dq[e];
+    device float4* dQ4 = (device float4*)args.dQ;
+    for (uint e = 0; e < nq; ++e) dQ4[i_off4 + e] = dq[e];
 }
 
 // ---------------------------------------------------------------------------
@@ -153,26 +162,34 @@ kernel void flash_attention_bwd_dkdv(
     const uint h = g / p.seq_len, j = g % p.seq_len, d = p.d_head;
     const float scale = 1.0f / sqrt((float)d);
     const uint head_off = h * p.seq_len * d;
-    const uint j_off = head_off + j * d;
 
-    // (Scalar — same reason as bwd_dq: register/occupancy-bound, float4 gave no win.)
-    float kreg[MAX_DHEAD], vreg[MAX_DHEAD], dk[MAX_DHEAD], dv[MAX_DHEAD];
-    for (uint e = 0; e < d; ++e) { kreg[e] = args.K[j_off + e]; vreg[e] = args.V[j_off + e]; dk[e] = 0.0f; dv[e] = 0.0f; }
+    // float4-vectorized: the inner loop streams Q[i]/dO[i] from global for every i.
+    const uint nq = d >> 2;                          // float4 lanes (d % 4 == 0)
+    const uint hoff4 = head_off >> 2;
+    const uint j_off4 = hoff4 + j * nq;
+    device const float4* Q4  = (device const float4*)args.Q;
+    device const float4* K4  = (device const float4*)args.K;
+    device const float4* V4  = (device const float4*)args.V;
+    device const float4* dO4 = (device const float4*)args.dO;
+    float4 kreg[MAX_DHEAD4], vreg[MAX_DHEAD4], dk[MAX_DHEAD4], dv[MAX_DHEAD4];
+    for (uint e = 0; e < nq; ++e) { kreg[e] = K4[j_off4 + e]; vreg[e] = V4[j_off4 + e]; dk[e] = float4(0.0f); dv[e] = float4(0.0f); }
 
     for (uint i = j; i < p.seq_len; ++i) {          // causal i>=j
-        const uint i_off = head_off + i * d;
+        const uint i_off4 = hoff4 + i * nq;
         const float Li = args.L[h * p.seq_len + i];
         const float Di = args.D[h * p.seq_len + i];
         float s = 0.0f;
-        for (uint e = 0; e < d; ++e) s += args.Q[i_off + e] * kreg[e];
+        for (uint e = 0; e < nq; ++e) s += dot(Q4[i_off4 + e], kreg[e]);
         const float pij = exp(s * scale - Li);
         float dp = 0.0f;
-        for (uint e = 0; e < d; ++e) dp += args.dO[i_off + e] * vreg[e];
+        for (uint e = 0; e < nq; ++e) dp += dot(dO4[i_off4 + e], vreg[e]);
         const float ds = pij * (dp - Di);
-        for (uint e = 0; e < d; ++e) {
-            dv[e] += pij * args.dO[i_off + e];
-            dk[e] += scale * ds * args.Q[i_off + e];
+        for (uint e = 0; e < nq; ++e) {
+            dv[e] += pij * dO4[i_off4 + e];
+            dk[e] += scale * ds * Q4[i_off4 + e];
         }
     }
-    for (uint e = 0; e < d; ++e) { args.dK[j_off + e] = dk[e]; args.dV[j_off + e] = dv[e]; }
+    device float4* dK4 = (device float4*)args.dK;
+    device float4* dV4 = (device float4*)args.dV;
+    for (uint e = 0; e < nq; ++e) { dK4[j_off4 + e] = dk[e]; dV4[j_off4 + e] = dv[e]; }
 }
