@@ -161,7 +161,7 @@
 
     const BOARDS = {
       pretraining: {
-        label: "Pretraining",
+        label: "Pretrain",
         blurb: "Full model training runs — ranked by validation loss at a fixed compute (FLOP) budget. Lower is better.",
         rankKey: "loss_at_budget", rankDir: "asc", fallbackKey: "val_loss",
         columns: [
@@ -177,7 +177,7 @@
         ],
       },
       flashattention: {
-        label: "FlashAttention",
+        label: "Flash fwd",
         blurb: "FlashAttention forward kernel (causal, M3 GPU via IREE). Ranked by throughput. Higher TFLOP/s is better.",
         rankKey: "tflops", rankDir: "desc",
         columns: [
@@ -186,6 +186,20 @@
           { key: "speedup", label: "vs standard", fmt: (n) => { const v = num(2)(n); return v == null ? null : v + "×"; }, dir: "desc" },
           { key: "peak_mem_mb", label: "Peak mem", fmt: (n) => { const v = num(0)(n); return v == null ? null : v + " MB"; }, dir: "asc" },
           { key: "max_abs_err", label: "Max abs err", fmt: sci, dir: "asc" },
+          { key: "shape", label: "Shape (H×S×D)", fmt: str },
+          { key: "dtype", label: "dtype", fmt: str },
+        ],
+      },
+      flashattention_bwd: {
+        label: "Flash bwd",
+        blurb: "FlashAttention backward kernel (dQ/dK/dV, causal, M3 GPU via IREE). Ranked by throughput. Higher TFLOP/s is better.",
+        rankKey: "tflops", rankDir: "desc",
+        columns: [
+          { key: "tflops", label: "TFLOP/s", fmt: num(2), primary: true, dir: "desc" },
+          { key: "latency_ms", label: "Latency", fmt: (n) => { const v = num(3)(n); return v == null ? null : v + " ms"; }, dir: "asc" },
+          { key: "speedup", label: "vs standard", fmt: (n) => { const v = num(2)(n); return v == null ? null : v + "×"; }, dir: "desc" },
+          { key: "peak_mem_mb", label: "Peak mem", fmt: (n) => { const v = num(0)(n); return v == null ? null : v + " MB"; }, dir: "asc" },
+          { key: "max_abs_err", label: "Max abs err (dQdKdV)", fmt: sci, dir: "asc" },
           { key: "shape", label: "Shape (H×S×D)", fmt: str },
           { key: "dtype", label: "dtype", fmt: str },
         ],

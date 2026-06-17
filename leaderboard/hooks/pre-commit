@@ -18,7 +18,9 @@ echo "$changed" | grep -qE '^(gemm_iree\.py|iree_metal/kernels/gemm)'  && want_g
 [ "$want_flash" -eq 0 ] && [ "$want_gemm" -eq 0 ] && exit 0
 
 flags=""
-[ "$want_flash" -eq 1 ] && flags="$flags --flash"
+# Forward and backward share flash_attention.metal + attention.py, so a flash
+# change re-benchmarks both kernels.
+[ "$want_flash" -eq 1 ] && flags="$flags --flash --flash-bwd"
 [ "$want_gemm" -eq 1 ]  && flags="$flags --gemm"
 
 echo "[leaderboard] kernel change detected — benchmarking in background ($flags)"

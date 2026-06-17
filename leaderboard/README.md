@@ -1,13 +1,14 @@
 # nlearn leaderboard
 
 Live leaderboard at **leaderboard.nikliolios.com** for the optimization problems
-the nlearn agent works on. Three boards:
+the nlearn agent works on. Four boards:
 
-| Board | What it tracks | Ranked by |
+| Board (UI tab) | What it tracks | Ranked by |
 |---|---|---|
-| **Pretraining** | full model training runs | validation loss at a fixed FLOP budget (lower = better) |
-| **FlashAttention** | the attention kernel (`attention.py:attention`) | TFLOP/s (higher = better) |
-| **GEMM** | the matmul path | TFLOP/s (higher = better) |
+| **Pretraining** (`pretraining`) | full model training runs | validation loss at a fixed FLOP budget (lower = better) |
+| **Flash fwd** (`flashattention`) | the attention forward kernel (`attention.py:attention`) | TFLOP/s (higher = better) |
+| **Flash bwd** (`flashattention_bwd`) | the attention backward kernel (VJP of `attention()`: dQ/dK/dV) | TFLOP/s (higher = better) |
+| **GEMM** (`gemm`) | the matmul path (`gemm_iree.matmul`) | TFLOP/s (higher = better) |
 
 Metrics are columns. The frontend is mobile-first: each row is a tappable card,
 big tap targets, no horizontal scroll, auto-refreshes every 15s.
@@ -84,9 +85,10 @@ Now committing changes to `attention.py`, `gemm_iree.py`, or
 commit) that posts fresh numbers. Run it manually any time:
 
 ```bash
-python bench_kernels.py --flash          # attention kernel (attention.py:attention)
+python bench_kernels.py --flash          # attention forward (attention.py:attention)
+python bench_kernels.py --flash-bwd      # attention backward (VJP of attention())
 python bench_kernels.py --gemm           # GEMM kernel (gemm_iree.matmul)
-python bench_kernels.py                  # both
+python bench_kernels.py                  # all of the above
 ```
 
 Each kernel version is a row, keyed by a content hash of the source — re-running

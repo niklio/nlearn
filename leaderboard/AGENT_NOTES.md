@@ -1,7 +1,8 @@
 # Leaderboard — notes for the nlearn agent
 
 A live leaderboard was added to this project at **https://leaderboard.nikliolios.com**
-with three boards — Pretraining, FlashAttention, and GEMM. It's a Cloudflare
+with four boards — Pretraining, FlashAttention forward, FlashAttention backward,
+and GEMM. It's a Cloudflare
 Worker + KV store; the code lives in `leaderboard/`. You don't need to touch the
 Worker — it's deployed and running. You only need to produce data for it.
 
@@ -53,11 +54,17 @@ the cluster, `train.py` will fail to import. No new pip dependencies (stdlib onl
     validation loss is NaN and won't populate. Those rows still show train loss,
     TFLOP/s, MFU, and tokens, but won't rank by val loss. Run with validation
     enabled (don't set `NLEARN_NO_VAL`) if you want the ranking metric.
-- **FlashAttention** — `python bench_kernels.py --flash`. Benchmarks
+- **FlashAttention (forward)** — `python bench_kernels.py --flash`. Benchmarks
   `attention.py:attention` (the dispatch function), so it measures whichever
   implementation is active (the IREE-Metal flash kernel when on that backend,
   else standard). Metrics: TFLOP/s, latency, speedup vs naive dense attention,
   peak mem, max abs error, shape, dtype.
+- **FlashAttention (backward)** — `python bench_kernels.py --flash-bwd`. Times
+  the VJP of `attention()` in isolation (forward residuals captured first, not
+  timed), i.e. the dQ/dK/dV work — the `flash_attention_bwd_dq`/`_dkdv` kernels
+  when flash is active. Posts to the **flashattention_bwd** board (UI tab "Flash
+  bwd"). TFLOP/s uses backward ≈ 2.5× forward FLOPs; max abs error is the max
+  over dQ/dK/dV vs an analytic reference.
 - **GEMM** — `python bench_kernels.py --gemm`. Benchmarks `gemm_iree.matmul`,
   which dispatches the hand-authored Metal simdgroup GEMM kernel on IREE-Metal
   (f16 in / f32 accumulate) and falls back to `jnp.matmul` elsewhere. Defaults to

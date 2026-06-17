@@ -147,6 +147,94 @@ def _active_attention_impl(attn_mod):
     return "standard"
 
 
+def _attn_bwd_reference(Qn, Kn, Vn, dOn, dhead):
+    """Analytic causal-attention backward (float64 NumPy): returns dQ, dK, dV."""
+    import numpy as np
+    H, S, D = Qn.shape
+    scale = np.sqrt(dhead)
+    causal = np.triu(np.ones((S, S)), 1).astype(bool)
+    dQ = np.zeros_like(Qn); dK = np.zeros_like(Kn); dV = np.zeros_like(Vn)
+    for h in range(H):
+        sc = (Qn[h] @ Kn[h].T) / scale
+        sc[causal] = -np.inf
+        P = np.exp(sc - sc.max(-1, keepdims=True))
+        P /= P.sum(-1, keepdims=True)
+        dV[h] = P.T @ dOn[h]
+        dP = dOn[h] @ Vn[h].T
+        dS = P * (dP - (dP * P).sum(-1, keepdims=True))   # softmax jacobian, rowwise
+        dQ[h] = (dS @ Kn[h]) / scale
+        dK[h] = (dS.T @ Qn[h]) / scale
+    return dQ, dK, dV
+
+
+def bench_flash_bwd(heads, seq, dhead, dtype_name, warmup, trials):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import attention as attn_mod
+
+    dtype = getattr(jnp, dtype_name)
+    rng = np.random.default_rng(0)
+    shape = (heads, seq, dhead)
+    Qn = rng.standard_normal(shape).astype(np.float32)
+    Kn = rng.standard_normal(shape).astype(np.float32)
+    Vn = rng.standard_normal(shape).astype(np.float32)
+    dOn = rng.standard_normal(shape).astype(np.float32)
+    Q, K, V, dO = (jnp.asarray(x, dtype=dtype) for x in (Qn, Kn, Vn, dOn))
+
+    # Isolate the backward pass: build the VJP once (forward NOT timed), then time
+    # only vjp_fn(dO) — that's the dQ/dK/dV work (the flash bwd kernels when active).
+    _, vjp_fn = jax.vjp(attn_mod.attention, Q, K, V)
+    bwd = jax.jit(vjp_fn)
+    latency = _time_fn(lambda: bwd(dO), warmup, trials)
+
+    # Backward FLOPs ≈ 2.5× forward (standard convention); causal forward = 2·H·S²·D.
+    flops = 2.5 * 2 * heads * seq * seq * dhead
+    tflops = flops / latency / 1e12
+
+    # Speedup vs the backward of naive dense O(S²) attention.
+    def naive(q, k, v):
+        scale = jnp.sqrt(jnp.asarray(dhead, dtype=dtype))
+        sc = jnp.matmul(q, k.transpose(0, 2, 1)) / scale
+        pos = jnp.arange(seq)
+        mask = jnp.where(pos[:, None] >= pos[None, :], 0.0, -jnp.inf).astype(dtype)
+        return jnp.matmul(jax.nn.softmax(sc + mask[None], axis=-1), v)
+    _, naive_vjp = jax.vjp(naive, Q, K, V)
+    naive_bwd = jax.jit(naive_vjp)
+    naive_latency = _time_fn(lambda: naive_bwd(dO), warmup, trials)
+    speedup = naive_latency / latency if latency > 0 else None
+
+    # Correctness: dQ/dK/dV vs the float64 analytic reference (max over all three).
+    dQk, dKk, dVk = (np.asarray(g, dtype=np.float32) for g in bwd(dO))
+    dQr, dKr, dVr = _attn_bwd_reference(Qn, Kn, Vn, dOn, dhead)
+    max_abs_err = float(max(np.max(np.abs(dQk - dQr)),
+                            np.max(np.abs(dKk - dKr)),
+                            np.max(np.abs(dVk - dVr))))
+
+    impl_name = _active_attention_impl(attn_mod)
+    src_hash = _hash_files([
+        os.path.join(HERE, "attention.py"),
+        os.path.join(HERE, "iree_metal", "kernels", "flash_attention.metal"),
+    ])
+    entry = {
+        "id": f"flashbwd-{impl_name}-{src_hash}",
+        "name": f"{impl_name} · {src_hash}",
+        "status": "done",
+        "metrics": {
+            "tflops": round(tflops, 4),
+            "latency_ms": round(latency * 1e3, 4),
+            "speedup": round(speedup, 3) if speedup else None,
+            "peak_mem_mb": round(_peak_mem_mb(), 1),
+            "max_abs_err": max_abs_err,
+            "shape": f"{heads}×{seq}×{dhead}",
+            "dtype": dtype_name,
+            "impl": impl_name,
+        },
+    }
+    _report_and_post("flashattention_bwd", entry)
+    return entry
+
+
 # ---------------------------------------------------------------------------
 # GEMM board
 # ---------------------------------------------------------------------------
@@ -248,7 +336,8 @@ def _report_and_post(board, entry):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--flash", action="store_true", help="benchmark the attention kernel")
+    p.add_argument("--flash", action="store_true", help="benchmark the attention forward kernel")
+    p.add_argument("--flash-bwd", action="store_true", help="benchmark the attention backward kernel")
     p.add_argument("--gemm", action="store_true", help="benchmark the GEMM kernel")
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--seq", type=int, default=512)
@@ -263,15 +352,22 @@ def main():
     p.add_argument("--trials", type=int, default=30)
     args = p.parse_args()
 
-    # Default: run both.
-    run_flash = args.flash or not (args.flash or args.gemm)
-    run_gemm = args.gemm or not (args.flash or args.gemm)
+    # Default (no flags): run everything.
+    any_flag = args.flash or args.flash_bwd or args.gemm
+    run_flash = args.flash or not any_flag
+    run_flash_bwd = args.flash_bwd or not any_flag
+    run_gemm = args.gemm or not any_flag
 
     if run_flash:
         try:
             bench_flash(args.heads, args.seq, args.dhead, args.dtype, args.warmup, args.trials)
         except Exception as e:
             print(f"[flashattention] benchmark failed: {type(e).__name__}: {e}")
+    if run_flash_bwd:
+        try:
+            bench_flash_bwd(args.heads, args.seq, args.dhead, args.dtype, args.warmup, args.trials)
+        except Exception as e:
+            print(f"[flashattention_bwd] benchmark failed: {type(e).__name__}: {e}")
     if run_gemm:
         try:
             bench_gemm(args.m, args.n, args.k, args.gemm_dtype, args.warmup, args.trials)
