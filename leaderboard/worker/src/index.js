@@ -11,7 +11,7 @@
  * its own row in place rather than appending duplicates.
  */
 
-const BOARDS = ["pretraining", "flashattention", "flashattention_bwd", "gemm"];
+const BOARDS = ["pretraining", "flashattention", "gemm", "crossentropy"];
 const MAX_ENTRIES = 200; // per board; oldest-updated rows evicted past this
 
 const JSON_HEADERS = {
