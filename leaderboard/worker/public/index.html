@@ -3,124 +3,160 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0d1117" />
+  <meta name="theme-color" content="#0b0d10" media="(prefers-color-scheme: dark)" />
+  <meta name="theme-color" content="#fbfcfd" media="(prefers-color-scheme: light)" />
   <title>nlearn leaderboard</title>
-  <meta name="description" content="Live leaderboard for the nlearn agent's optimization runs — pretraining, FlashAttention, and GEMM." />
+  <meta name="description" content="Live leaderboard for the nlearn agent's optimization runs — pretraining, FlashAttention (forward + backward), and GEMM." />
   <meta name="robots" content="noindex" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>▚</text></svg>" />
   <style>
     :root {
-      --bg: #0d1117;
-      --panel: #161b22;
-      --panel-2: #1c2430;
-      --line: #283242;
-      --text: #e6edf3;
-      --muted: #8b97a7;
-      --accent: #4cc2ff;
-      --gold: #ffd479;
-      --good: #56d364;
-      --run: #d29922;
+      --bg: #0b0d10;
+      --bg-soft: #12151a;
+      --line: #20262e;
+      --fg: #e7ebf0;
+      --fg-dim: #9aa4b1;
+      --fg-mute: #5f6b78;
+      --accent: #a5b4fc;
+      --accent-dim: #818cf8;
+      --err: #f87171;
+      --radius: 12px;
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #fbfcfd;
+        --bg-soft: #f1f4f7;
+        --line: #e2e7ec;
+        --fg: #11161c;
+        --fg-dim: #4b5563;
+        --fg-mute: #8b95a1;
+        --accent: #0d9488;
+        --accent-dim: #0f766e;
+        --err: #dc2626;
+      }
     }
     * { box-sizing: border-box; }
-    html { -webkit-text-size-adjust: 100%; }
+    html { -webkit-text-size-adjust: 100%; overflow-x: hidden; }
     body {
       margin: 0;
       background: var(--bg);
-      color: var(--text);
-      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      padding: max(12px, env(safe-area-inset-top)) 12px calc(48px + env(safe-area-inset-bottom));
+      color: var(--fg);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.5;
+      letter-spacing: 0.1px;
+      padding: max(16px, env(safe-area-inset-top)) clamp(14px, 5vw, 24px) calc(56px + env(safe-area-inset-bottom));
       -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
-    .wrap { max-width: 960px; margin: 0 auto; }
-    header { padding: 6px 2px 14px; }
-    h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
-    .sub { color: var(--muted); font-size: 13px; margin-top: 3px; }
+    .wrap { max-width: 880px; margin: 0 auto; }
+    header { padding: 6px 0 18px; }
+    h1 { font-size: 1.5rem; margin: 0; letter-spacing: -0.02em; font-weight: 650; }
+    h1 .mark { color: var(--accent); }
+    .sub { color: var(--fg-dim); font-family: var(--mono); font-size: 0.8rem; margin-top: 6px; }
 
     /* Board switcher — big tap targets, full-width segmented control */
     .tabs {
-      display: flex; gap: 6px; margin: 14px 0 10px;
-      background: var(--panel); padding: 5px; border-radius: 14px;
+      display: flex; gap: 5px; margin: 16px 0 14px;
+      background: var(--bg-soft); border: 1px solid var(--line);
+      padding: 5px; border-radius: var(--radius);
     }
     .tab {
       flex: 1; appearance: none; border: 0; cursor: pointer;
-      background: transparent; color: var(--muted);
-      font: inherit; font-weight: 600; font-size: 15px;
-      padding: 12px 8px; min-height: 48px; border-radius: 10px;
+      background: transparent; color: var(--fg-mute);
+      font-family: var(--mono); font-weight: 500; font-size: 0.82rem; letter-spacing: 0.01em;
+      padding: 12px 6px; min-height: 48px; border-radius: 9px;
       transition: background .15s, color .15s;
     }
-    .tab[aria-selected="true"] { background: var(--panel-2); color: var(--text); box-shadow: 0 1px 0 rgba(255,255,255,.04) inset; }
+    .tab[aria-selected="true"] {
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+      color: var(--accent);
+    }
     .tab:active { transform: scale(.98); }
 
-    .blurb { color: var(--muted); font-size: 13px; margin: 2px 2px 12px; min-height: 18px; }
+    .blurb { color: var(--fg-dim); font-size: 0.82rem; line-height: 1.5; margin: 2px 2px 16px; min-height: 18px; }
 
     .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
     .sortbox { display: flex; gap: 6px; flex: 1; min-width: 0; }
     select, .btn {
-      appearance: none; background: var(--panel); color: var(--text);
-      border: 1px solid var(--line); border-radius: 10px;
-      font: inherit; font-size: 14px; padding: 11px 12px; min-height: 46px;
-      cursor: pointer;
+      appearance: none; background: var(--bg-soft); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 9px;
+      font-family: var(--mono); font-size: 0.8rem; padding: 11px 12px; min-height: 46px;
+      cursor: pointer; transition: border-color .15s, color .15s;
     }
+    select:hover, .btn:hover { border-color: var(--accent-dim); }
     select { flex: 1; min-width: 0; background-image: none; }
-    .btn { font-weight: 600; }
+    .btn { font-weight: 500; color: var(--fg-dim); }
     .btn:active { transform: scale(.97); }
     .dir { width: 52px; text-align: center; }
 
-    .status { color: var(--muted); font-size: 12px; margin: 0 2px 10px; display: flex; gap: 8px; align-items: center; }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); display: inline-block; }
-    .dot.stale { background: var(--muted); }
-    .dot.err { background: #f85149; }
+    .status { color: var(--fg-mute); font-family: var(--mono); font-size: 0.72rem; margin: 0 2px 12px; display: flex; gap: 8px; align-items: center; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); display: inline-block; }
+    .dot.stale { background: var(--fg-mute); }
+    .dot.err { background: var(--err); }
 
     /* Table (wide screens) */
     table { width: 100%; border-collapse: collapse; }
     thead th {
-      text-align: right; font-size: 12px; color: var(--muted); font-weight: 600;
-      padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap;
+      text-align: right; font-family: var(--mono); font-size: 0.68rem; font-weight: 500;
+      text-transform: uppercase; letter-spacing: 0.12em; color: var(--fg-mute);
+      padding: 10px 10px; border-bottom: 1px solid var(--line); white-space: nowrap;
     }
     thead th.name-col { text-align: left; }
-    tbody td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    tbody td {
+      padding: 13px 10px; border-bottom: 1px solid var(--line); text-align: right;
+      font-family: var(--mono); font-size: 0.84rem; color: var(--fg-dim);
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+    }
     tbody td.name-col { text-align: left; }
-    tbody tr:active { background: var(--panel); }
+    tbody tr { transition: background .12s; }
+    tbody tr:hover { background: var(--bg-soft); }
 
-    .rank { color: var(--muted); font-weight: 700; margin-right: 8px; font-variant-numeric: tabular-nums; }
-    tr.top1 .rank { color: var(--gold); }
-    .name { font-weight: 600; }
-    .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; margin-left: 8px; vertical-align: middle; }
-    .badge.running { background: rgba(210,153,34,.18); color: var(--run); }
-    .badge.done { background: rgba(86,211,100,.14); color: var(--good); }
-    .primary-val { color: var(--accent); font-weight: 700; }
+    .rank { color: var(--fg-mute); font-weight: 600; margin-right: 9px; font-variant-numeric: tabular-nums; }
+    tr.top1 .rank { color: var(--accent); }
+    .name { color: var(--fg); font-family: var(--sans); font-weight: 600; letter-spacing: -0.01em; }
+    .badge {
+      font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.03em;
+      padding: 0.14rem 0.55rem; border-radius: 999px; margin-left: 9px; vertical-align: middle; white-space: nowrap;
+    }
+    .badge.running { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+    .badge.done { color: var(--fg-mute); background: var(--bg-soft); border: 1px solid var(--line); }
+    .primary-val { color: var(--accent); font-weight: 600; }
 
-    .empty, .err-msg { color: var(--muted); text-align: center; padding: 40px 12px; font-size: 14px; }
-    .err-msg { color: #f85149; }
+    .empty, .err-msg { color: var(--fg-mute); font-family: var(--mono); text-align: center; padding: 48px 12px; font-size: 0.82rem; }
+    .err-msg { color: var(--err); }
 
     /* Mobile: each row becomes a card; metrics stack as label/value pairs. No hscroll. */
     @media (max-width: 719px) {
       thead { display: none; }
       table, tbody { display: block; }
       tbody tr {
-        display: block; background: var(--panel); border: 1px solid var(--line);
-        border-radius: 14px; padding: 6px 14px 10px; margin-bottom: 12px;
+        display: block; background: var(--bg-soft); border: 1px solid var(--line);
+        border-radius: var(--radius); padding: 4px 16px 12px; margin-bottom: 14px;
       }
-      tbody tr.top1 { border-color: rgba(255,212,121,.4); }
-      tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; border: 0; padding: 9px 0; border-bottom: 1px solid var(--line); white-space: normal; text-align: right; }
+      tbody tr:hover { background: var(--bg-soft); }
+      tbody tr.top1 { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+      tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; border: 0; padding: 10px 0; border-bottom: 1px solid var(--line); white-space: normal; text-align: right; font-size: 0.88rem; }
       tbody td:last-child { border-bottom: 0; }
       tbody td::before {
-        content: attr(data-label); color: var(--muted); font-size: 13px;
-        font-weight: 500; text-align: left; flex: 0 0 auto;
+        content: attr(data-label); font-family: var(--mono); color: var(--fg-mute);
+        font-size: 0.74rem; letter-spacing: 0.02em; font-weight: 500; text-align: left; flex: 0 0 auto;
       }
       tbody td.name-col {
-        display: block; padding: 8px 0 10px; margin-bottom: 4px;
-        border-bottom: 1px solid var(--line); font-size: 17px;
+        display: block; padding: 12px 0; margin-bottom: 2px;
+        border-bottom: 1px solid var(--line); font-size: 1.05rem;
       }
       tbody td.name-col::before { content: none; }
-      .primary-val { font-size: 17px; }
+      .primary-val { font-size: 1rem; }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
     <header>
-      <h1>nlearn leaderboard ▚</h1>
+      <h1>nlearn leaderboard <span class="mark">▚</span></h1>
       <div class="sub">live optimization runs from the nlearn agent</div>
     </header>
 
