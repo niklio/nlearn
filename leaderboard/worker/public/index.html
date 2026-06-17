@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d1117" />
+  <title>nlearn leaderboard</title>
+  <meta name="description" content="Live leaderboard for the nlearn agent's optimization runs — pretraining, FlashAttention, and GEMM." />
+  <meta name="robots" content="noindex" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>▚</text></svg>" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-2: #1c2430;
+      --line: #283242;
+      --text: #e6edf3;
+      --muted: #8b97a7;
+      --accent: #4cc2ff;
+      --gold: #ffd479;
+      --good: #56d364;
+      --run: #d29922;
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: max(12px, env(safe-area-inset-top)) 12px calc(48px + env(safe-area-inset-bottom));
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; }
+    header { padding: 6px 2px 14px; }
+    h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 3px; }
+
+    /* Board switcher — big tap targets, full-width segmented control */
+    .tabs {
+      display: flex; gap: 6px; margin: 14px 0 10px;
+      background: var(--panel); padding: 5px; border-radius: 14px;
+    }
+    .tab {
+      flex: 1; appearance: none; border: 0; cursor: pointer;
+      background: transparent; color: var(--muted);
+      font: inherit; font-weight: 600; font-size: 15px;
+      padding: 12px 8px; min-height: 48px; border-radius: 10px;
+      transition: background .15s, color .15s;
+    }
+    .tab[aria-selected="true"] { background: var(--panel-2); color: var(--text); box-shadow: 0 1px 0 rgba(255,255,255,.04) inset; }
+    .tab:active { transform: scale(.98); }
+
+    .blurb { color: var(--muted); font-size: 13px; margin: 2px 2px 12px; min-height: 18px; }
+
+    .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .sortbox { display: flex; gap: 6px; flex: 1; min-width: 0; }
+    select, .btn {
+      appearance: none; background: var(--panel); color: var(--text);
+      border: 1px solid var(--line); border-radius: 10px;
+      font: inherit; font-size: 14px; padding: 11px 12px; min-height: 46px;
+      cursor: pointer;
+    }
+    select { flex: 1; min-width: 0; background-image: none; }
+    .btn { font-weight: 600; }
+    .btn:active { transform: scale(.97); }
+    .dir { width: 52px; text-align: center; }
+
+    .status { color: var(--muted); font-size: 12px; margin: 0 2px 10px; display: flex; gap: 8px; align-items: center; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); display: inline-block; }
+    .dot.stale { background: var(--muted); }
+    .dot.err { background: #f85149; }
+
+    /* Table (wide screens) */
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      text-align: right; font-size: 12px; color: var(--muted); font-weight: 600;
+      padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap;
+    }
+    thead th.name-col { text-align: left; }
+    tbody td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    tbody td.name-col { text-align: left; }
+    tbody tr:active { background: var(--panel); }
+
+    .rank { color: var(--muted); font-weight: 700; margin-right: 8px; font-variant-numeric: tabular-nums; }
+    tr.top1 .rank { color: var(--gold); }
+    .name { font-weight: 600; }
+    .badge { font-size: 11px; padding: 2px 7px; border-radius: 999px; margin-left: 8px; vertical-align: middle; }
+    .badge.running { background: rgba(210,153,34,.18); color: var(--run); }
+    .badge.done { background: rgba(86,211,100,.14); color: var(--good); }
+    .primary-val { color: var(--accent); font-weight: 700; }
+
+    .empty, .err-msg { color: var(--muted); text-align: center; padding: 40px 12px; font-size: 14px; }
+    .err-msg { color: #f85149; }
+
+    /* Mobile: each row becomes a card; metrics stack as label/value pairs. No hscroll. */
+    @media (max-width: 719px) {
+      thead { display: none; }
+      table, tbody { display: block; }
+      tbody tr {
+        display: block; background: var(--panel); border: 1px solid var(--line);
+        border-radius: 14px; padding: 6px 14px 10px; margin-bottom: 12px;
+      }
+      tbody tr.top1 { border-color: rgba(255,212,121,.4); }
+      tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; border: 0; padding: 9px 0; border-bottom: 1px solid var(--line); white-space: normal; text-align: right; }
+      tbody td:last-child { border-bottom: 0; }
+      tbody td::before {
+        content: attr(data-label); color: var(--muted); font-size: 13px;
+        font-weight: 500; text-align: left; flex: 0 0 auto;
+      }
+      tbody td.name-col {
+        display: block; padding: 8px 0 10px; margin-bottom: 4px;
+        border-bottom: 1px solid var(--line); font-size: 17px;
+      }
+      tbody td.name-col::before { content: none; }
+      .primary-val { font-size: 17px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>nlearn leaderboard ▚</h1>
+      <div class="sub">live optimization runs from the nlearn agent</div>
+    </header>
+
+    <div class="tabs" id="tabs" role="tablist"></div>
+    <div class="blurb" id="blurb"></div>
+
+    <div class="controls">
+      <div class="sortbox">
+        <select id="sort" aria-label="Sort by"></select>
+        <button class="btn dir" id="dir" aria-label="Toggle sort direction">↑</button>
+      </div>
+      <button class="btn" id="refresh" aria-label="Refresh now">↻ Refresh</button>
+    </div>
+
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">loading…</span>
+    </div>
+
+    <div id="board"></div>
+  </div>
+
+  <script>
+    // ---- Per-board column specs (data-driven). Values are read from
+    // entry.metrics[key], falling back to entry[key]. ----
+    const num = (d) => (n) => (n == null || isNaN(n)) ? null : Number(n).toFixed(d);
+    const pct = (n) => (n == null || isNaN(n)) ? null : (Number(n) * 100).toFixed(1) + "%";
+    const compact = (n) => {
+      if (n == null || isNaN(n)) return null;
+      n = Number(n);
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+      return String(n);
+    };
+    const sci = (n) => (n == null || isNaN(n)) ? null : Number(n).toExponential(1);
+    const str = (s) => (s == null || s === "") ? null : String(s);
+
+    const BOARDS = {
+      pretraining: {
+        label: "Pretraining",
+        blurb: "Full model training runs — ranked by validation loss at a fixed compute (FLOP) budget. Lower is better.",
+        rankKey: "loss_at_budget", rankDir: "asc", fallbackKey: "val_loss",
+        columns: [
+          { key: "loss_at_budget", label: "Loss @ budget", fmt: num(3), primary: true, dir: "asc" },
+          { key: "val_loss", label: "Best val loss", fmt: num(3), dir: "asc" },
+          { key: "train_loss", label: "Train loss", fmt: num(3), dir: "asc" },
+          { key: "tflops", label: "TFLOP/s", fmt: num(2), dir: "desc" },
+          { key: "mfu", label: "MFU", fmt: pct, dir: "desc" },
+          { key: "tokens", label: "Tokens", fmt: compact, dir: "desc" },
+          { key: "step_time", label: "Step time", fmt: (n) => { const v = num(2)(n); return v == null ? null : v + "s"; }, dir: "asc" },
+          { key: "peak_mem_gb", label: "Peak mem", fmt: (n) => { const v = num(1)(n); return v == null ? null : v + " GB"; }, dir: "asc" },
+          { key: "dataset", label: "Dataset", fmt: str },
+        ],
+      },
+      flashattention: {
+        label: "FlashAttention",
+        blurb: "FlashAttention forward kernel (causal, M3 GPU via IREE). Ranked by throughput. Higher TFLOP/s is better.",
+        rankKey: "tflops", rankDir: "desc",
+        columns: [
+          { key: "tflops", label: "TFLOP/s", fmt: num(2), primary: true, dir: "desc" },
+          { key: "latency_ms", label: "Latency", fmt: (n) => { const v = num(3)(n); return v == null ? null : v + " ms"; }, dir: "asc" },
+          { key: "speedup", label: "vs standard", fmt: (n) => { const v = num(2)(n); return v == null ? null : v + "×"; }, dir: "desc" },
+          { key: "peak_mem_mb", label: "Peak mem", fmt: (n) => { const v = num(0)(n); return v == null ? null : v + " MB"; }, dir: "asc" },
+          { key: "max_abs_err", label: "Max abs err", fmt: sci, dir: "asc" },
+          { key: "shape", label: "Shape (H×S×D)", fmt: str },
+          { key: "dtype", label: "dtype", fmt: str },
+        ],
+      },
+      gemm: {
+        label: "GEMM",
+        blurb: "GEMM kernel benchmarks (M3 GPU via IREE). Ranked by throughput. Higher TFLOP/s is better.",
+        rankKey: "tflops", rankDir: "desc",
+        columns: [
+          { key: "tflops", label: "TFLOP/s", fmt: num(2), primary: true, dir: "desc" },
+          { key: "pct_peak", label: "% of peak", fmt: pct, dir: "desc" },
+          { key: "latency_ms", label: "Latency", fmt: (n) => { const v = num(3)(n); return v == null ? null : v + " ms"; }, dir: "asc" },
+          { key: "shape", label: "Shape (M×N×K)", fmt: str },
+          { key: "dtype", label: "dtype", fmt: str },
+          { key: "max_abs_err", label: "Max abs err", fmt: sci, dir: "asc" },
+        ],
+      },
+    };
+
+    const API = new URLSearchParams(location.search).get("api") || "";
+    const $ = (id) => document.getElementById(id);
+    const cell = (e, key) => (e.metrics && e.metrics[key] != null) ? e.metrics[key] : e[key];
+
+    let current = location.hash.replace("#", "");
+    if (!BOARDS[current]) current = "pretraining";
+    let sortKey = null, sortDir = null;
+    let lastData = [];
+    let lastFetch = 0;
+
+    // ---- Build tabs ----
+    const tabsEl = $("tabs");
+    for (const id of Object.keys(BOARDS)) {
+      const b = document.createElement("button");
+      b.className = "tab"; b.textContent = BOARDS[id].label;
+      b.setAttribute("role", "tab");
+      b.onclick = () => selectBoard(id);
+      b.dataset.board = id;
+      tabsEl.appendChild(b);
+    }
+
+    function selectBoard(id) {
+      current = id;
+      location.hash = id;
+      sortKey = null; sortDir = null; // reset to board default
+      syncTabs();
+      buildSortOptions();
+      $("blurb").textContent = BOARDS[id].blurb;
+      render();
+      load();
+    }
+    function syncTabs() {
+      for (const t of tabsEl.children) t.setAttribute("aria-selected", String(t.dataset.board === current));
+    }
+
+    function buildSortOptions() {
+      const sel = $("sort");
+      sel.innerHTML = "";
+      for (const c of BOARDS[current].columns) {
+        if (c.fmt === str) continue; // don't sort by text columns
+        const o = document.createElement("option");
+        o.value = c.key; o.textContent = "Sort: " + c.label;
+        sel.appendChild(o);
+      }
+      sel.value = effectiveSortKey();
+      $("dir").textContent = effectiveSortDir() === "asc" ? "↑" : "↓";
+    }
+    const effectiveSortKey = () => sortKey || BOARDS[current].rankKey;
+    function effectiveSortDir() {
+      if (sortDir) return sortDir;
+      const col = BOARDS[current].columns.find((c) => c.key === effectiveSortKey());
+      return (col && col.dir) || BOARDS[current].rankDir;
+    }
+
+    $("sort").onchange = (e) => { sortKey = e.target.value; sortDir = null; buildSortOptions(); render(); };
+    $("dir").onclick = () => { sortDir = effectiveSortDir() === "asc" ? "desc" : "asc"; $("dir").textContent = sortDir === "asc" ? "↑" : "↓"; render(); };
+    $("refresh").onclick = () => load();
+
+    function sortEntries(entries) {
+      const key = effectiveSortKey(), dir = effectiveSortDir();
+      const fb = BOARDS[current].fallbackKey;
+      const val = (e, k) => { const v = cell(e, k); return (v == null || v === "" || isNaN(v)) ? null : Number(v); };
+      return [...entries].sort((a, b) => {
+        let av = val(a, key), bv = val(b, key);
+        // Entries missing the rank metric sort last, then by fallback.
+        if (av == null && bv == null && fb) { av = val(a, fb); bv = val(b, fb); }
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        return dir === "asc" ? av - bv : bv - av;
+      });
+    }
+
+    function render() {
+      const spec = BOARDS[current];
+      const host = $("board");
+      const entries = sortEntries(lastData);
+
+      if (!entries.length) {
+        host.innerHTML = '<div class="empty">No entries yet. Runs and kernel benchmarks will appear here as they post.</div>';
+        return;
+      }
+
+      const cols = spec.columns;
+      let html = "<table><thead><tr><th class='name-col'>Run</th>";
+      for (const c of cols) html += `<th>${c.label}</th>`;
+      html += "</tr></thead><tbody>";
+
+      entries.forEach((e, i) => {
+        const top = i === 0 ? " top1" : "";
+        const badge = e.status === "running"
+          ? '<span class="badge running">running</span>'
+          : '<span class="badge done">done</span>';
+        html += `<tr class="row${top}">`;
+        html += `<td class="name-col" data-label="Run"><span class="rank">#${i + 1}</span><span class="name">${esc(e.name || e.id)}</span>${badge}</td>`;
+        for (const c of cols) {
+          const raw = cell(e, c.key);
+          const v = c.fmt ? c.fmt(raw) : raw;
+          const cls = c.primary ? " class='primary-val'" : "";
+          html += `<td data-label="${c.label}"><span${cls}>${v == null ? "—" : esc(v)}</span></td>`;
+        }
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      host.innerHTML = html;
+    }
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    async function load() {
+      try {
+        const r = await fetch(`${API}/api/${current}`, { cache: "no-store" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        lastData = Array.isArray(data.entries) ? data.entries : [];
+        lastFetch = Date.now();
+        setStatus("ok");
+        render();
+      } catch (err) {
+        setStatus("err", err.message);
+        if (!lastData.length) $("board").innerHTML = `<div class="err-msg">Couldn't load the leaderboard (${esc(err.message)}).</div>`;
+      }
+    }
+
+    function setStatus(state, msg) {
+      const dot = $("dot");
+      if (state === "err") {
+        dot.className = "dot err";
+        $("statusText").textContent = "offline — " + (msg || "retrying");
+        return;
+      }
+      tickStatus();
+    }
+    function tickStatus() {
+      if (!lastFetch) return;
+      const secs = Math.round((Date.now() - lastFetch) / 1000);
+      const dot = $("dot");
+      dot.className = secs > 45 ? "dot stale" : "dot";
+      const ago = secs < 5 ? "just now" : secs < 60 ? `${secs}s ago` : `${Math.round(secs / 60)}m ago`;
+      $("statusText").textContent = `${lastData.length} ${lastData.length === 1 ? "entry" : "entries"} · updated ${ago}`;
+    }
+
+    // Init
+    syncTabs();
+    buildSortOptions();
+    $("blurb").textContent = BOARDS[current].blurb;
+    load();
+    setInterval(load, 15000);   // live refresh
+    setInterval(tickStatus, 1000);
+    window.addEventListener("hashchange", () => { const h = location.hash.replace("#", ""); if (BOARDS[h] && h !== current) selectBoard(h); });
+  </script>
+</body>
+</html>

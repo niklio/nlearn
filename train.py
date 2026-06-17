@@ -562,6 +562,7 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
         eval_batch_loss, loader.val_batches, val_every=VAL_EVERY,
         n_params=n_params, seq_len=seq_len, batch_size=batch_size,
         hw_peak_tflops=hw_peak_tflops,
+        run_name=run_name, dataset=dataset,
     )
     timer = StepTimer()
 
@@ -585,12 +586,14 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
         if _stop["requested"]:
             print("Saving checkpoint before exit...")
             save_checkpoint(params, step, run_name=run_name)
+            logger.finalize(loss, step, steps)
             wandb.finish()
             sys.exit(0)
 
     # --- Save final checkpoint ---
     final_path = save_checkpoint(params, steps, run_name=run_name)
     logger.print_summary(loss)
+    logger.finalize(loss, steps - 1, steps)
 
     artifact = wandb.Artifact(name="model-checkpoint", type="model")
     artifact.add_file(final_path)

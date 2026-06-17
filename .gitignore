@@ -5,3 +5,9 @@ datasets/
 .cluster.conf
 .cluster_ready
 tokenizer.json
+
+# leaderboard
+.leaderboard_bench.log
+leaderboard/worker/.dev.vars
+leaderboard/worker/.wrangler/
+leaderboard/worker/node_modules/

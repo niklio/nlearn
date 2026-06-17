@@ -236,6 +236,26 @@ def ensure_ready(conf):
         sync_code(conf)
 
 
+def leaderboard_config():
+    """LEADERBOARD_URL/TOKEN from the process env, falling back to the file the
+    deploy writes (~/.config/nlearn/leaderboard.env). Lets remote jobs post to
+    the leaderboard even when cluster.py is run from a non-interactive shell."""
+    out = {}
+    for k in ("LEADERBOARD_URL", "LEADERBOARD_TOKEN"):
+        if os.environ.get(k):
+            out[k] = os.environ[k]
+    env_file = Path.home() / ".config" / "nlearn" / "leaderboard.env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export "):]
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                out.setdefault(k.strip(), v.strip())
+    return out
+
+
 def submit_job(conf, cmd, label=""):
     """Write a job script to the cluster and submit via pueue. Returns job ID string."""
     job_script = f"/tmp/cluster_job_{int(time.time())}.sh"
@@ -245,11 +265,21 @@ def submit_job(conf, cmd, label=""):
     # placeholder (which would fail auth).
     _wk        = conf.get("WANDB_API_KEY", "")
     wandb_line = f"export WANDB_API_KEY={_wk}" if len(_wk) >= 40 else ""
+    # Forward leaderboard config so remote runs post to leaderboard.nikliolios.com.
+    # Prefer .cluster.conf, then the process env, then ~/.config/nlearn/leaderboard.env.
+    _lb = leaderboard_config()
+    _lb_url    = conf.get("LEADERBOARD_URL")   or _lb.get("LEADERBOARD_URL", "")
+    _lb_token  = conf.get("LEADERBOARD_TOKEN") or _lb.get("LEADERBOARD_TOKEN", "")
+    lb_lines   = "\n".join(filter(None, [
+        f"export LEADERBOARD_URL={_lb_url}" if _lb_url else "",
+        f"export LEADERBOARD_TOKEN={_lb_token}" if _lb_token else "",
+    ]))
     script     = (
         f"#!/bin/bash\n"
         f"export PATH=/opt/homebrew/bin:$PATH\n"
         f"{hf_line}\n"
         f"{wandb_line}\n"
+        f"{lb_lines}\n"
         f"{iree_env_preamble(conf)}\n"   # route jobs through the IREE-Metal stack
         f"cd {conf['CLUSTER_DIR']}\n"
         f"{cmd}\n"

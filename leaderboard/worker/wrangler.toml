@@ -1,0 +1,28 @@
+name = "nlearn-leaderboard"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Static frontend (public/index.html) is served for any non-/api request.
+# The Worker (src/index.js) only handles /api/*.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Live at https://leaderboard.nikliolios.com — custom_domain auto-creates the
+# CNAME in the Cloudflare zone for nikliolios.com (same account as the apex).
+[[routes]]
+pattern = "leaderboard.nikliolios.com"
+custom_domain = true
+
+# KV store holding one JSON array per board.
+# Create with:  npx wrangler kv namespace create LEADERBOARD_KV
+# then paste the returned id below (and a preview_id for `wrangler dev`).
+[[kv_namespaces]]
+binding = "LEADERBOARD_KV"
+id = "0643ff6e74c54597ad0df8f2431aa96b"
+preview_id = "7daf75ef991d42d0a49aff4c898a6bfd"
+
+# Write auth token (read by the Worker on POST). Set with:
+#   npx wrangler secret put LEADERBOARD_TOKEN
+# Do NOT commit the value here.

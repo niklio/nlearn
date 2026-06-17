@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# nlearn leaderboard pre-commit hook.
+#
+# When kernel-related code is staged, kick off a benchmark that posts fresh
+# numbers to the leaderboard. It runs in the BACKGROUND and always exits 0, so
+# committing is never blocked or slowed down — results land on the board a
+# little after the commit completes. Output goes to .leaderboard_bench.log.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+changed="$(git diff --cached --name-only || true)"
+
+want_flash=0; want_gemm=0
+echo "$changed" | grep -qE '^(attention\.py|iree_metal/kernels/flash)' && want_flash=1
+echo "$changed" | grep -qE '^(gemm_iree\.py|iree_metal/kernels/gemm)'  && want_gemm=1
+
+[ "$want_flash" -eq 0 ] && [ "$want_gemm" -eq 0 ] && exit 0
+
+flags=""
+[ "$want_flash" -eq 1 ] && flags="$flags --flash"
+[ "$want_gemm" -eq 1 ]  && flags="$flags --gemm"
+
+echo "[leaderboard] kernel change detected — benchmarking in background ($flags)"
+LOG="$ROOT/.leaderboard_bench.log"
+nohup "${PYTHON:-python3}" "$ROOT/bench_kernels.py" $flags >"$LOG" 2>&1 &
+exit 0

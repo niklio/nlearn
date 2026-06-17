@@ -11,6 +11,12 @@ import time
 import jax
 import wandb
 
+from leaderboard_client import post_entry
+
+# Compute budget (in FLOPs) at which val loss is captured for ranking, so runs
+# of different lengths/speeds are compared at equal compute. Overridable via env.
+DEFAULT_FLOP_BUDGET = float(os.environ.get("LEADERBOARD_FLOP_BUDGET", 1e16))
+
 
 def benchmark_peak_tflops(dtype=jax.numpy.bfloat16, n=2048, warmup=3, trials=10):
     """
@@ -91,7 +97,8 @@ class TrainingLogger:
     """Collects per-step metrics, logs to W&B, and prints summaries."""
 
     def __init__(self, eval_loss_fn, val_batches_fn, val_every=100,
-                 n_params=0, seq_len=512, batch_size=32, hw_peak_tflops=0.0):
+                 n_params=0, seq_len=512, batch_size=32, hw_peak_tflops=0.0,
+                 run_name=None, dataset="", flop_budget=None):
         self._eval_loss_fn = eval_loss_fn
         self._val_batches_fn = val_batches_fn
         self._val_every = val_every
@@ -100,10 +107,53 @@ class TrainingLogger:
         self._flops_per_step = estimate_flops_per_step(n_params, seq_len, batch_size)
         self._hw_peak_flops = hw_peak_tflops * 1e12  # convert TFLOPS → FLOPS
 
+        # --- Leaderboard state ---
+        self._tokens_per_step = batch_size * seq_len
+        self._dataset = dataset
+        self._flop_budget = flop_budget if flop_budget is not None else DEFAULT_FLOP_BUDGET
+        self._run_name = run_name or f"run-{int(time.time())}"
+        self._best_val_loss = float("inf")
+        self._loss_at_budget = None  # val loss captured when total_flops crosses budget
+        self._last_train_loss = None
+        self._last_tflops = 0.0
+        self._last_mfu = 0.0
+        self._last_step_time = 0.0
+        self._peak_mem_mb = 0.0
+
         # Tell W&B to also plot loss metrics against cumulative TFLOP (a count of
         # 10^12 ops, not the per-second rate) as x-axis.
         wandb.define_metric("loss/total_tflop")
         wandb.define_metric("loss/by_tflop/*", step_metric="loss/total_tflop")
+
+    def _leaderboard_metrics(self, step, n_steps):
+        """Snapshot of the run as leaderboard columns (pretraining board)."""
+        return {
+            "val_loss": None if self._best_val_loss == float("inf") else self._best_val_loss,
+            "loss_at_budget": self._loss_at_budget,
+            "train_loss": self._last_train_loss,
+            "tflops": self._last_tflops,
+            "mfu": self._last_mfu,
+            "tokens": (step + 1) * self._tokens_per_step,
+            "step_time": self._last_step_time,
+            "peak_mem_gb": self._peak_mem_mb / 1024.0,
+            "total_flops": self._total_flops,
+            "step": step,
+            "n_steps": n_steps,
+            "dataset": self._dataset,
+        }
+
+    def _post_leaderboard(self, step, n_steps, status):
+        post_entry("pretraining", {
+            "id": self._run_name,
+            "name": self._run_name,
+            "status": status,
+            "metrics": self._leaderboard_metrics(step, n_steps),
+        })
+
+    def finalize(self, loss, step, n_steps):
+        """Post the final 'done' row. Call once after the training loop."""
+        self._last_train_loss = float(loss)
+        self._post_leaderboard(step, n_steps, status="done")
 
 
     def _compute_val_loss(self, params):
@@ -135,6 +185,13 @@ class TrainingLogger:
             if self._hw_peak_flops > 0:
                 mfu = self._flops_per_step / (self._hw_peak_flops * timer.train_time)
 
+        # Track latest values for the leaderboard snapshot.
+        self._last_train_loss = float(loss)
+        self._last_tflops = tflops
+        self._last_mfu = mfu
+        self._last_step_time = timer.step_time
+        self._peak_mem_mb = mem_mb
+
         metrics = {
             "loss/train": float(loss),
             "hardware/step_time": timer.step_time,
@@ -155,6 +212,14 @@ class TrainingLogger:
             val_loss = self._compute_val_loss(params)
             metrics["loss/val"] = val_loss
             metrics["loss/by_tflop/val"] = val_loss
+
+            # Leaderboard bookkeeping: best val loss + loss at the FLOP budget.
+            if val_loss == val_loss:  # skip NaN (e.g. NLEARN_NO_VAL)
+                self._best_val_loss = min(self._best_val_loss, val_loss)
+                if self._loss_at_budget is None and self._total_flops >= self._flop_budget:
+                    self._loss_at_budget = val_loss
+            # Live upsert so the board updates mid-run (throttled to val steps).
+            self._post_leaderboard(step, n_steps, status="running")
 
         # Print to console
         if do_val:
