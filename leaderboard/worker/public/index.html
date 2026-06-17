@@ -54,35 +54,21 @@
     .wrap { width: 100%; margin: 0; }
     /* Controls stay a readable width (left-aligned); the data table goes full-bleed. */
     header, .blurb { max-width: 720px; }
-    .tabs, .controls { max-width: 640px; }
+    .controls, .sortbox { max-width: 640px; }
     header { padding: 6px 0 18px; }
     h1 { font-size: 1.5rem; margin: 0; letter-spacing: -0.02em; font-weight: 650; }
     h1 .mark { color: var(--accent); }
     .sub { color: var(--fg-dim); font-family: var(--mono); font-size: 0.8rem; margin-top: 6px; }
 
-    /* Board switcher — big tap targets, full-width segmented control */
-    .tabs {
-      display: flex; gap: 5px; margin: 16px 0 14px;
-      background: var(--bg-soft); border: 1px solid var(--line);
-      padding: 5px; border-radius: var(--radius);
-    }
-    .tab {
-      flex: 1; appearance: none; border: 0; cursor: pointer;
-      background: transparent; color: var(--fg-mute);
-      font-family: var(--mono); font-weight: 500; font-size: 0.82rem; letter-spacing: 0.01em;
-      padding: 12px 6px; min-height: 48px; border-radius: 9px;
-      transition: background .15s, color .15s;
-    }
-    .tab[aria-selected="true"] {
-      background: color-mix(in srgb, var(--accent) 14%, transparent);
-      color: var(--accent);
-    }
-    .tab:active { transform: scale(.98); }
+    /* Board selector (dropdown) + refresh */
+    .controls { display: flex; gap: 8px; align-items: center; margin: 16px 0 12px; flex-wrap: wrap; }
+    .board-select { flex: 1; min-width: 0; color: var(--fg); font-weight: 600; }
+    .blurb { color: var(--fg-dim); font-size: 0.82rem; line-height: 1.5; margin: 2px 2px 16px; min-height: 18px; max-width: 720px; }
 
-    .blurb { color: var(--fg-dim); font-size: 0.82rem; line-height: 1.5; margin: 2px 2px 16px; min-height: 18px; }
-
-    .controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-    .sortbox { display: flex; gap: 6px; flex: 1; min-width: 0; }
+    /* Mobile sort control; on desktop you sort by double-clicking headers. */
+    .sortbox { display: flex; gap: 6px; margin-bottom: 12px; }
+    .sortbox #sort { flex: 1; min-width: 0; }
+    @media (min-width: 720px) { .sortbox { display: none; } }
     select, .btn {
       appearance: none; background: var(--bg-soft); color: var(--fg);
       border: 1px solid var(--line); border-radius: 9px;
@@ -110,6 +96,9 @@
       padding: 10px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
     }
     thead th.name-col { text-align: left; }
+    thead th.sortable { cursor: pointer; user-select: none; -webkit-user-select: none; transition: color .12s; }
+    thead th.sortable:hover { color: var(--fg-dim); }
+    thead th.sorted { color: var(--accent); }
     tbody td {
       padding: 13px 8px; border-bottom: 1px solid var(--line); text-align: right;
       font-family: var(--mono); font-size: 0.84rem; color: var(--fg-dim);
@@ -166,15 +155,16 @@
       <div class="sub">live optimization runs from the nlearn agent</div>
     </header>
 
-    <div class="tabs" id="tabs" role="tablist"></div>
+    <div class="controls">
+      <select id="board-select" class="board-select" aria-label="Select leaderboard"></select>
+      <button class="btn" id="refresh" aria-label="Refresh now">↻ Refresh</button>
+    </div>
     <div class="blurb" id="blurb"></div>
 
-    <div class="controls">
-      <div class="sortbox">
-        <select id="sort" aria-label="Sort by"></select>
-        <button class="btn dir" id="dir" aria-label="Toggle sort direction">↑</button>
-      </div>
-      <button class="btn" id="refresh" aria-label="Refresh now">↻ Refresh</button>
+    <!-- Mobile sort control (desktop sorts by double-clicking column headers). -->
+    <div class="sortbox" id="sortbox">
+      <select id="sort" aria-label="Sort by"></select>
+      <button class="btn dir" id="dir" aria-label="Toggle sort direction">↑</button>
     </div>
 
     <div class="status">
@@ -271,66 +261,100 @@
     let lastData = [];
     let lastFetch = 0;
 
-    // ---- Build tabs ----
-    const tabsEl = $("tabs");
+    // Synthetic sort keys for the Run (name) and Updated (timestamp) columns.
+    const NAME_KEY = "__name", TIME_KEY = "__updated";
+
+    // ---- Board selector (dropdown) ----
+    const boardSel = $("board-select");
     for (const id of Object.keys(BOARDS)) {
-      const b = document.createElement("button");
-      b.className = "tab"; b.textContent = BOARDS[id].label;
-      b.setAttribute("role", "tab");
-      b.onclick = () => selectBoard(id);
-      b.dataset.board = id;
-      tabsEl.appendChild(b);
+      const o = document.createElement("option");
+      o.value = id; o.textContent = BOARDS[id].label;
+      boardSel.appendChild(o);
     }
+    boardSel.onchange = (e) => selectBoard(e.target.value);
 
     function selectBoard(id) {
       current = id;
       location.hash = id;
       sortKey = null; sortDir = null; // reset to board default
-      syncTabs();
+      boardSel.value = id;
       buildSortOptions();
       $("blurb").textContent = BOARDS[id].blurb;
       render();
       load();
     }
-    function syncTabs() {
-      for (const t of tabsEl.children) t.setAttribute("aria-selected", String(t.dataset.board === current));
-    }
 
     function buildSortOptions() {
       const sel = $("sort");
       sel.innerHTML = "";
+      const opts = [[NAME_KEY, "Run"]];
       for (const c of BOARDS[current].columns) {
-        if (c.fmt === str) continue; // don't sort by text columns
+        if (c.fmt === str) continue; // text columns rarely useful to sort by on mobile
+        opts.push([c.key, c.label]);
+      }
+      opts.push([TIME_KEY, "Updated"]);
+      for (const [val, label] of opts) {
         const o = document.createElement("option");
-        o.value = c.key; o.textContent = "Sort: " + c.label;
+        o.value = val; o.textContent = "Sort: " + label;
         sel.appendChild(o);
       }
       sel.value = effectiveSortKey();
       $("dir").textContent = effectiveSortDir() === "asc" ? "↑" : "↓";
     }
+
     const effectiveSortKey = () => sortKey || BOARDS[current].rankKey;
-    function effectiveSortDir() {
-      if (sortDir) return sortDir;
-      const col = BOARDS[current].columns.find((c) => c.key === effectiveSortKey());
+    function defaultDir(key) {
+      if (key === NAME_KEY) return "asc";
+      if (key === TIME_KEY) return "desc";
+      const col = BOARDS[current].columns.find((c) => c.key === key);
       return (col && col.dir) || BOARDS[current].rankDir;
+    }
+    function effectiveSortDir() { return sortDir || defaultDir(effectiveSortKey()); }
+
+    // Set the sort column; clicking the active column again flips direction.
+    function sortByKey(key) {
+      if (effectiveSortKey() === key) {
+        sortDir = effectiveSortDir() === "asc" ? "desc" : "asc";
+      } else {
+        sortKey = key; sortDir = null; // start in the column's natural direction
+      }
+      buildSortOptions();
+      render();
     }
 
     $("sort").onchange = (e) => { sortKey = e.target.value; sortDir = null; buildSortOptions(); render(); };
-    $("dir").onclick = () => { sortDir = effectiveSortDir() === "asc" ? "desc" : "asc"; $("dir").textContent = sortDir === "asc" ? "↑" : "↓"; render(); };
+    $("dir").onclick = () => { sortDir = effectiveSortDir() === "asc" ? "desc" : "asc"; buildSortOptions(); render(); };
     $("refresh").onclick = () => load();
 
+    // Excel-style: double-click a column header to sort by it.
+    $("board").addEventListener("dblclick", (ev) => {
+      const th = ev.target.closest("th[data-key]");
+      if (th) sortByKey(th.dataset.key);
+    });
+
+    function sortValue(e, key) {
+      if (key === NAME_KEY) return (e.name || e.id || "").toLowerCase();
+      if (key === TIME_KEY) { const t = Date.parse(e.updated_at || ""); return isNaN(t) ? null : t; }
+      const v = cell(e, key);
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return isNaN(n) ? String(v).toLowerCase() : n;
+    }
+
     function sortEntries(entries) {
-      const key = effectiveSortKey(), dir = effectiveSortDir();
-      const fb = BOARDS[current].fallbackKey;
-      const val = (e, k) => { const v = cell(e, k); return (v == null || v === "" || isNaN(v)) ? null : Number(v); };
+      const key = effectiveSortKey(), dir = effectiveSortDir(), fb = BOARDS[current].fallbackKey;
+      const cmp = (a, b) => {
+        if (typeof a === "number" && typeof b === "number") return a - b;
+        return String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0;
+      };
       return [...entries].sort((a, b) => {
-        let av = val(a, key), bv = val(b, key);
+        let av = sortValue(a, key), bv = sortValue(b, key);
         // Entries missing the rank metric sort last, then by fallback.
-        if (av == null && bv == null && fb) { av = val(a, fb); bv = val(b, fb); }
+        if (av == null && bv == null && fb) { av = sortValue(a, fb); bv = sortValue(b, fb); }
         if (av == null && bv == null) return 0;
-        if (av == null) return 1;
+        if (av == null) return 1;   // nulls always last, regardless of direction
         if (bv == null) return -1;
-        return dir === "asc" ? av - bv : bv - av;
+        return dir === "asc" ? cmp(av, bv) : -cmp(av, bv);
       });
     }
 
@@ -345,9 +369,18 @@
       }
 
       const cols = spec.columns;
-      let html = "<div class='tablewrap'><table><thead><tr><th class='name-col'>Run</th>";
-      for (const c of cols) html += `<th>${c.label}</th>`;
-      html += "<th class='time-col'>Updated</th></tr></thead><tbody>";
+      const sk = effectiveSortKey(), sd = effectiveSortDir();
+      const th = (key, label, extra) => {
+        const active = key === sk;
+        const arrow = active ? (sd === "asc" ? " ▲" : " ▼") : "";
+        const cls = ["sortable", extra, active ? "sorted" : ""].filter(Boolean).join(" ");
+        return `<th class="${cls}" data-key="${key}" title="Double-click to sort">${esc(label)}${arrow}</th>`;
+      };
+      let html = "<div class='tablewrap'><table><thead><tr>";
+      html += th(NAME_KEY, "Run", "name-col");
+      for (const c of cols) html += th(c.key, c.label);
+      html += th(TIME_KEY, "Updated", "time-col");
+      html += "</tr></thead><tbody>";
 
       entries.forEach((e, i) => {
         const top = i === 0 ? " top1" : "";
@@ -417,7 +450,7 @@
     }
 
     // Init
-    syncTabs();
+    boardSel.value = current;
     buildSortOptions();
     $("blurb").textContent = BOARDS[current].blurb;
     load();
