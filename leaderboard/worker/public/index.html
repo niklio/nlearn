@@ -65,10 +65,9 @@
     .board-select { flex: 1; min-width: 0; color: var(--fg); font-weight: 600; }
     .blurb { color: var(--fg-dim); font-size: 0.82rem; line-height: 1.5; margin: 2px 2px 16px; min-height: 18px; max-width: 720px; }
 
-    /* Mobile sort control; on desktop you sort by double-clicking headers. */
-    .sortbox { display: flex; gap: 6px; margin-bottom: 12px; }
+    /* Sort control (the list shows collapsed rows, so sorting is via this menu). */
+    .sortbox { display: flex; gap: 6px; margin-bottom: 12px; max-width: 640px; }
     .sortbox #sort { flex: 1; min-width: 0; }
-    @media (min-width: 720px) { .sortbox { display: none; } }
     select, .btn {
       appearance: none; background: var(--bg-soft); color: var(--fg);
       border: 1px solid var(--line); border-radius: 9px;
@@ -86,66 +85,67 @@
     .dot.stale { background: var(--fg-mute); }
     .dot.err { background: var(--err); }
 
-    /* Table (wide screens). Wrapper lets a wide table scroll within its own box
-       on desktop instead of breaking the page; on mobile rows become cards. */
-    .tablewrap { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; }
-    thead th {
-      text-align: right; font-family: var(--mono); font-size: 0.68rem; font-weight: 500;
-      text-transform: uppercase; letter-spacing: 0.12em; color: var(--fg-mute);
-      padding: 10px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
+    /* Collapsed run rows (the list). Each row is a button that opens the run's
+       detail page. Shows rank, name, the headline metric, and the date. */
+    .rows { display: flex; flex-direction: column; max-width: 920px; }
+    .run-row {
+      display: flex; align-items: center; gap: 12px; width: 100%;
+      padding: 15px 10px; background: transparent; border: 0;
+      border-bottom: 1px solid var(--line); text-align: left; cursor: pointer;
+      color: inherit; font: inherit; transition: background .12s;
     }
-    thead th.name-col { text-align: left; }
-    thead th.sortable { cursor: pointer; user-select: none; -webkit-user-select: none; transition: color .12s; }
-    thead th.sortable:hover { color: var(--fg-dim); }
-    thead th.sorted { color: var(--accent); }
-    tbody td {
-      padding: 13px 8px; border-bottom: 1px solid var(--line); text-align: right;
-      font-family: var(--mono); font-size: 0.84rem; color: var(--fg-dim);
-      font-variant-numeric: tabular-nums; white-space: nowrap;
-    }
-    tbody td.name-col { text-align: left; }
-    tbody tr { transition: background .12s; }
-    tbody tr:hover { background: var(--bg-soft); }
-
-    .rank { color: var(--fg-mute); font-weight: 600; margin-right: 9px; font-variant-numeric: tabular-nums; }
-    tr.top1 .rank { color: var(--accent); }
-    .name { color: var(--fg); font-family: var(--sans); font-weight: 600; letter-spacing: -0.01em; }
+    .run-row:hover, .run-row:focus-visible { background: var(--bg-soft); outline: none; }
+    .rank { color: var(--fg-mute); font-family: var(--mono); font-weight: 600; font-variant-numeric: tabular-nums; flex: 0 0 auto; }
+    .run-row.top1 .rank { color: var(--accent); }
+    .run-name { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 9px; }
+    .name { color: var(--fg); font-family: var(--sans); font-weight: 600; letter-spacing: -0.01em;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .badge {
       font-family: var(--mono); font-size: 0.62rem; letter-spacing: 0.03em;
-      padding: 0.14rem 0.55rem; border-radius: 999px; margin-left: 9px; vertical-align: middle; white-space: nowrap;
+      padding: 0.14rem 0.55rem; border-radius: 999px; vertical-align: middle; white-space: nowrap; flex: 0 0 auto;
     }
     .badge.running { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
     .badge.done { color: var(--fg-mute); background: var(--bg-soft); border: 1px solid var(--line); }
-    .primary-val { color: var(--accent); font-weight: 600; }
-    .time-col span { color: var(--fg-mute); font-size: 0.92em; }
+    .run-meta { display: flex; align-items: center; gap: 18px; flex: 0 0 auto; }
+    .run-primary { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .run-primary b { color: var(--accent); font-weight: 600; font-size: 0.95rem; }
+    .run-primary small { display: block; color: var(--fg-mute); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 2px; }
+    .run-date { color: var(--fg-mute); font-family: var(--mono); font-size: 0.76rem; white-space: nowrap; min-width: 92px; text-align: right; }
+    .chev { color: var(--fg-mute); font-size: 1.25rem; line-height: 1; flex: 0 0 auto; }
+
+    @media (max-width: 560px) {
+      .run-meta { flex-direction: column; align-items: flex-end; gap: 2px; }
+      .run-primary small { display: none; }
+      .run-date { min-width: 0; font-size: 0.72rem; }
+    }
+
+    /* Detail "page" — the expanded run (all numbers; charts later). */
+    .back {
+      display: inline-flex; align-items: center; gap: 6px; margin: 2px 0 18px;
+      background: transparent; border: 0; color: var(--fg-dim); cursor: pointer;
+      font-family: var(--mono); font-size: 0.82rem; padding: 8px 2px; min-height: 40px;
+    }
+    .back:hover { color: var(--accent); }
+    .detail-name { font-size: 1.4rem; font-weight: 650; letter-spacing: -0.02em; }
+    .detail-sub { color: var(--fg-mute); font-family: var(--mono); font-size: 0.78rem; margin-top: 9px; line-height: 1.5; }
+    .metric-grid {
+      display: grid; gap: 10px; margin-top: 22px;
+      grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
+    }
+    .metric { background: var(--bg-soft); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+    .metric.primary { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+    .m-label { color: var(--fg-mute); font-family: var(--mono); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; }
+    .m-value { color: var(--fg); font-family: var(--mono); font-size: 1.1rem; font-variant-numeric: tabular-nums; margin-top: 8px; word-break: break-word; }
+    .metric.primary .m-value { color: var(--accent); }
 
     .empty, .err-msg { color: var(--fg-mute); font-family: var(--mono); text-align: center; padding: 48px 12px; font-size: 0.82rem; }
     .err-msg { color: var(--err); }
 
-    /* Mobile: each row becomes a card; metrics stack as label/value pairs. No hscroll. */
-    @media (max-width: 719px) {
-      thead { display: none; }
-      table, tbody { display: block; }
-      tbody tr {
-        display: block; background: var(--bg-soft); border: 1px solid var(--line);
-        border-radius: var(--radius); padding: 4px 16px 12px; margin-bottom: 14px;
-      }
-      tbody tr:hover { background: var(--bg-soft); }
-      tbody tr.top1 { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
-      tbody td { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; border: 0; padding: 10px 0; border-bottom: 1px solid var(--line); white-space: normal; text-align: right; font-size: 0.88rem; }
-      tbody td:last-child { border-bottom: 0; }
-      tbody td::before {
-        content: attr(data-label); font-family: var(--mono); color: var(--fg-mute);
-        font-size: 0.74rem; letter-spacing: 0.02em; font-weight: 500; text-align: left; flex: 0 0 auto;
-      }
-      tbody td.name-col {
-        display: block; padding: 12px 0; margin-bottom: 2px;
-        border-bottom: 1px solid var(--line); font-size: 1.05rem;
-      }
-      tbody td.name-col::before { content: none; }
-      .primary-val { font-size: 1rem; }
-    }
+    /* Detail view hides the list controls; back button replaces them. */
+    body[data-view="detail"] .controls,
+    body[data-view="detail"] #blurb,
+    body[data-view="detail"] #sortbox,
+    body[data-view="detail"] .status { display: none; }
   </style>
 </head>
 <body>
@@ -255,8 +255,15 @@
     const $ = (id) => document.getElementById(id);
     const cell = (e, key) => (e.metrics && e.metrics[key] != null) ? e.metrics[key] : e[key];
 
-    let current = location.hash.replace("#", "");
-    if (!BOARDS[current]) current = "pretraining";
+    // Route: "#board" = list view, "#board/runId" = that run's detail page.
+    function parseHash() {
+      const h = location.hash.replace(/^#/, "");
+      const i = h.indexOf("/");
+      if (i === -1) return { board: h, id: null };
+      return { board: h.slice(0, i), id: decodeURIComponent(h.slice(i + 1)) };
+    }
+    let { board: current, id: currentRunId } = parseHash();
+    if (!BOARDS[current]) { current = "pretraining"; currentRunId = null; }
     let sortKey = null, sortDir = null;
     let lastData = [];
     let lastFetch = 0;
@@ -275,6 +282,7 @@
 
     function selectBoard(id) {
       current = id;
+      currentRunId = null;
       location.hash = id;
       sortKey = null; sortDir = null; // reset to board default
       boardSel.value = id;
@@ -282,6 +290,19 @@
       $("blurb").textContent = BOARDS[id].blurb;
       render();
       load();
+    }
+
+    // Navigation between the list and a run's detail page.
+    function openRun(id) {
+      currentRunId = id;
+      location.hash = current + "/" + encodeURIComponent(id);
+      window.scrollTo(0, 0);
+      render();
+    }
+    function backToList() {
+      currentRunId = null;
+      location.hash = current;
+      render();
     }
 
     function buildSortOptions() {
@@ -326,10 +347,11 @@
     $("dir").onclick = () => { sortDir = effectiveSortDir() === "asc" ? "desc" : "asc"; buildSortOptions(); render(); };
     $("refresh").onclick = () => load();
 
-    // Excel-style: double-click a column header to sort by it.
-    $("board").addEventListener("dblclick", (ev) => {
-      const th = ev.target.closest("th[data-key]");
-      if (th) sortByKey(th.dataset.key);
+    // Click a row → open its detail page; click "← back" → return to the list.
+    $("board").addEventListener("click", (ev) => {
+      if (ev.target.closest(".back")) { backToList(); return; }
+      const row = ev.target.closest(".run-row");
+      if (row) openRun(row.dataset.id);
     });
 
     function sortValue(e, key) {
@@ -359,46 +381,93 @@
     }
 
     function render() {
-      const spec = BOARDS[current];
+      document.body.dataset.view = currentRunId ? "detail" : "list";
+      if (currentRunId) renderDetail();
+      else renderList();
+    }
+
+    // Pick the headline metric for a collapsed row: the primary column, or the
+    // fallback metric when the primary is absent for this run.
+    function headlineFor(e, spec) {
+      const pcol = spec.columns.find((c) => c.primary) || spec.columns[0];
+      let col = pcol, raw = cell(e, pcol.key);
+      if (raw == null && spec.fallbackKey) {
+        const fc = spec.columns.find((c) => c.key === spec.fallbackKey);
+        if (fc && cell(e, fc.key) != null) { col = fc; raw = cell(e, fc.key); }
+      }
+      const v = col.fmt ? col.fmt(raw) : raw;
+      return { label: col.label, value: v == null ? "—" : v };
+    }
+
+    function renderList() {
       const host = $("board");
       const entries = sortEntries(lastData);
-
       if (!entries.length) {
-        host.innerHTML = '<div class="empty">No entries yet. Runs and kernel benchmarks will appear here as they post.</div>';
+        host.innerHTML = lastFetch
+          ? '<div class="empty">No entries yet. Runs and kernel benchmarks will appear here as they post.</div>'
+          : '<div class="empty">Loading…</div>';
         return;
       }
-
-      const cols = spec.columns;
-      const sk = effectiveSortKey(), sd = effectiveSortDir();
-      const th = (key, label, extra) => {
-        const active = key === sk;
-        const arrow = active ? (sd === "asc" ? " ▲" : " ▼") : "";
-        const cls = ["sortable", extra, active ? "sorted" : ""].filter(Boolean).join(" ");
-        return `<th class="${cls}" data-key="${key}" title="Double-click to sort">${esc(label)}${arrow}</th>`;
-      };
-      let html = "<div class='tablewrap'><table><thead><tr>";
-      html += th(NAME_KEY, "Run", "name-col");
-      for (const c of cols) html += th(c.key, c.label);
-      html += th(TIME_KEY, "Updated", "time-col");
-      html += "</tr></thead><tbody>";
-
+      const spec = BOARDS[current];
+      let html = '<div class="rows">';
       entries.forEach((e, i) => {
         const top = i === 0 ? " top1" : "";
         const badge = e.status === "running"
           ? '<span class="badge running">running</span>'
           : '<span class="badge done">done</span>';
-        html += `<tr class="row${top}">`;
-        html += `<td class="name-col" data-label="Run"><span class="rank">#${i + 1}</span><span class="name">${esc(e.name || e.id)}</span>${badge}</td>`;
-        for (const c of cols) {
-          const raw = cell(e, c.key);
-          const v = c.fmt ? c.fmt(raw) : raw;
-          const cls = c.primary ? " class='primary-val'" : "";
-          html += `<td data-label="${c.label}"><span${cls}>${v == null ? "—" : esc(v)}</span></td>`;
-        }
-        html += `<td class="time-col" data-label="Updated"><span title="${esc(e.updated_at || "")}">${esc(fmtDate(e.updated_at))}</span></td>`;
-        html += "</tr>";
+        const h = headlineFor(e, spec);
+        html += `<button type="button" class="run-row${top}" data-id="${esc(e.id)}">`
+          + `<span class="rank">#${i + 1}</span>`
+          + `<span class="run-name"><span class="name">${esc(e.name || e.id)}</span>${badge}</span>`
+          + `<span class="run-meta">`
+          +   `<span class="run-primary"><b>${esc(h.value)}</b><small>${esc(h.label)}</small></span>`
+          +   `<span class="run-date" title="${esc(e.updated_at || "")}">${esc(fmtDate(e.updated_at))}</span>`
+          + `</span>`
+          + `<span class="chev" aria-hidden="true">›</span>`
+          + `</button>`;
       });
-      html += "</tbody></table></div>";
+      html += "</div>";
+      host.innerHTML = html;
+    }
+
+    function renderDetail() {
+      const host = $("board");
+      const spec = BOARDS[current];
+      const entries = sortEntries(lastData);
+      const idx = entries.findIndex((e) => e.id === currentRunId);
+      const e = idx >= 0 ? entries[idx] : null;
+      const backBtn = `<button type="button" class="back">← ${esc(spec.label)}</button>`;
+      if (!e) {
+        host.innerHTML = backBtn + (lastFetch
+          ? '<div class="empty">Run not found on this board.</div>'
+          : '<div class="empty">Loading…</div>');
+        return;
+      }
+      const badge = e.status === "running"
+        ? '<span class="badge running">running</span>'
+        : '<span class="badge done">done</span>';
+
+      const metrics = [];
+      for (const c of spec.columns) {
+        const raw = cell(e, c.key);
+        const v = c.fmt ? c.fmt(raw) : raw;
+        metrics.push({ label: c.label, value: v == null ? "—" : String(v), primary: !!c.primary });
+      }
+      // Run metadata after the board's own metrics.
+      metrics.push({ label: "Status", value: e.status || "—" });
+      metrics.push({ label: "Created", value: fmtDate(e.created_at) });
+      metrics.push({ label: "Run id", value: e.id });
+
+      let html = backBtn;
+      html += `<div class="detail-head"><span class="detail-name">${esc(e.name || e.id)}</span> ${badge}`
+        + `<div class="detail-sub">${esc(spec.label)} · rank #${idx + 1} of ${entries.length} · updated ${esc(fmtDate(e.updated_at))}</div></div>`;
+      html += '<div class="metric-grid">';
+      for (const m of metrics) {
+        html += `<div class="metric${m.primary ? " primary" : ""}">`
+          + `<div class="m-label">${esc(m.label)}</div>`
+          + `<div class="m-value">${esc(m.value)}</div></div>`;
+      }
+      html += "</div>";
       host.innerHTML = html;
     }
 
@@ -453,10 +522,24 @@
     boardSel.value = current;
     buildSortOptions();
     $("blurb").textContent = BOARDS[current].blurb;
+    render();
     load();
     setInterval(load, 15000);   // live refresh
     setInterval(tickStatus, 1000);
-    window.addEventListener("hashchange", () => { const h = location.hash.replace("#", ""); if (BOARDS[h] && h !== current) selectBoard(h); });
+    window.addEventListener("hashchange", () => {
+      const { board, id } = parseHash();
+      const b = BOARDS[board] ? board : "pretraining";
+      if (b !== current) {
+        current = b; currentRunId = id;
+        boardSel.value = b; sortKey = null; sortDir = null;
+        buildSortOptions(); $("blurb").textContent = BOARDS[b].blurb;
+        render(); load();
+      } else if (id !== currentRunId) {
+        currentRunId = id;
+        window.scrollTo(0, 0);
+        render();
+      }
+    });
   </script>
 </body>
 </html>
