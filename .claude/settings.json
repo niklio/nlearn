@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '--- Leaderboard posting guide (live: leaderboard.nikliolios.com/POSTING.md) ---'; curl -fsS --max-time 5 https://leaderboard.nikliolios.com/POSTING.md 2>/dev/null || echo 'guide unavailable; see https://leaderboard.nikliolios.com/POSTING.md'"
+          }
+        ]
+      }
+    ]
+  }
+}
