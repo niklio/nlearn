@@ -1,0 +1,67 @@
+{
+  "title": "nlearn leaderboard",
+  "subtitle": "live optimization runs from the nlearn agent",
+  "boards": [
+    {
+      "id": "pretraining",
+      "label": "Pretraining",
+      "blurb": "Full model training runs — ranked by validation loss at a fixed compute (FLOP) budget. Lower is better.",
+      "rank": { "key": "loss_at_budget", "dir": "asc", "fallback": "val_loss" },
+      "columns": [
+        { "key": "loss_at_budget", "label": "Loss @ budget", "format": { "type": "number", "decimals": 3 }, "primary": true, "dir": "asc" },
+        { "key": "val_loss", "label": "Best val loss", "format": { "type": "number", "decimals": 3 }, "dir": "asc" },
+        { "key": "train_loss", "label": "Train loss", "format": { "type": "number", "decimals": 3 }, "dir": "asc" },
+        { "key": "tflops", "label": "TFLOP/s", "format": { "type": "number", "decimals": 2 }, "dir": "desc" },
+        { "key": "mfu", "label": "MFU", "format": { "type": "percent" }, "dir": "desc" },
+        { "key": "tokens", "label": "Tokens", "format": { "type": "compact" }, "dir": "desc" },
+        { "key": "step_time", "label": "Step time", "format": { "type": "number", "decimals": 2, "suffix": "s" }, "dir": "asc" },
+        { "key": "peak_mem_gb", "label": "Peak mem", "format": { "type": "number", "decimals": 1, "suffix": " GB" }, "dir": "asc" },
+        { "key": "dataset", "label": "Dataset", "format": { "type": "string" } }
+      ]
+    },
+    {
+      "id": "flashattention",
+      "label": "FlashAttention",
+      "blurb": "FlashAttention forward kernel (causal, M3 GPU via IREE). Ranked by throughput. Higher TFLOP/s is better.",
+      "rank": { "key": "tflops", "dir": "desc" },
+      "columns": [
+        { "key": "tflops", "label": "TFLOP/s", "format": { "type": "number", "decimals": 2 }, "primary": true, "dir": "desc" },
+        { "key": "latency_ms", "label": "Latency", "format": { "type": "number", "decimals": 3, "suffix": " ms" }, "dir": "asc" },
+        { "key": "speedup", "label": "vs standard", "format": { "type": "number", "decimals": 2, "suffix": "×" }, "dir": "desc" },
+        { "key": "peak_mem_mb", "label": "Peak mem", "format": { "type": "number", "decimals": 0, "suffix": " MB" }, "dir": "asc" },
+        { "key": "max_abs_err", "label": "Max abs err", "format": { "type": "scientific" }, "dir": "asc" },
+        { "key": "shape", "label": "Shape (H×S×D)", "format": { "type": "string" } },
+        { "key": "dtype", "label": "dtype", "format": { "type": "string" } }
+      ]
+    },
+    {
+      "id": "gemm",
+      "label": "GEMM",
+      "blurb": "GEMM kernel benchmarks (M3 GPU via IREE). Ranked by throughput. Higher TFLOP/s is better.",
+      "rank": { "key": "tflops", "dir": "desc" },
+      "columns": [
+        { "key": "tflops", "label": "TFLOP/s", "format": { "type": "number", "decimals": 2 }, "primary": true, "dir": "desc" },
+        { "key": "pct_peak", "label": "% of peak", "format": { "type": "percent" }, "dir": "desc" },
+        { "key": "latency_ms", "label": "Latency", "format": { "type": "number", "decimals": 3, "suffix": " ms" }, "dir": "asc" },
+        { "key": "shape", "label": "Shape (M×N×K)", "format": { "type": "string" } },
+        { "key": "dtype", "label": "dtype", "format": { "type": "string" } },
+        { "key": "max_abs_err", "label": "Max abs err", "format": { "type": "scientific" }, "dir": "asc" }
+      ]
+    },
+    {
+      "id": "crossentropy",
+      "label": "Cross-Entropy",
+      "blurb": "Fused cross-entropy (loss + dlogits) kernel — M3 GPU via IREE. Ranked by latency; the win is never materializing the (M×vocab) logits/one-hot, so peak memory is the long-context enabler. Lower latency / lower memory is better.",
+      "rank": { "key": "latency_ms", "dir": "asc" },
+      "columns": [
+        { "key": "latency_ms", "label": "Latency", "format": { "type": "number", "decimals": 3, "suffix": " ms" }, "primary": true, "dir": "asc" },
+        { "key": "speedup", "label": "vs one-hot", "format": { "type": "number", "decimals": 2, "suffix": "×" }, "dir": "desc" },
+        { "key": "peak_mem_mb", "label": "Peak mem", "format": { "type": "number", "decimals": 0, "suffix": " MB" }, "dir": "asc" },
+        { "key": "gb_s", "label": "GB/s", "format": { "type": "number", "decimals": 1 }, "dir": "desc" },
+        { "key": "max_abs_err", "label": "Max abs err", "format": { "type": "scientific" }, "dir": "asc" },
+        { "key": "shape", "label": "Shape (M×V)", "format": { "type": "string" } },
+        { "key": "dtype", "label": "dtype", "format": { "type": "string" } }
+      ]
+    }
+  ]
+}
