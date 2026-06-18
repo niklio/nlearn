@@ -133,6 +133,10 @@
     .m-row:last-child { border-bottom: 0; }
     .m-label { color: var(--fg-mute); font-family: var(--mono); font-size: 0.82rem; }
     .m-value { color: var(--fg); font-family: var(--mono); font-size: 0.9rem; font-variant-numeric: tabular-nums; text-align: right; word-break: break-word; }
+    .m-value a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+    .m-value a:hover { border-bottom-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+    .prov { margin-top: 28px; max-width: 540px; }
+    .prov-h { color: var(--fg-mute); font-family: var(--mono); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 2px; }
 
     .empty, .err-msg { color: var(--fg-mute); font-family: var(--mono); text-align: center; padding: 48px 12px; font-size: 0.82rem; }
     .err-msg { color: var(--err); }
@@ -462,7 +466,24 @@
         html += `<div class="m-row"><span class="m-label">${esc(m.label)}</span><span class="m-value">${esc(m.value)}</span></div>`;
       }
       html += "</div>";
+
+      // Provenance: link to the codebase snapshot and the kernel rows this run used.
+      if (e.commit_url || e.kernels) {
+        html += '<div class="prov"><div class="prov-h">Provenance</div><div class="metrics">';
+        if (e.commit_url) {
+          const sha = (e.commit || "").slice(0, 10) || "view";
+          html += `<div class="m-row"><span class="m-label">Codebase snapshot</span>`
+            + `<span class="m-value"><a href="${esc(e.commit_url)}" target="_blank" rel="noopener">${esc(sha)} ↗</a></span></div>`;
+        }
+        for (const [bd, hash] of Object.entries(e.kernels || {})) {
+          const label = (BOARDS[bd] && BOARDS[bd].label) || bd;
+          html += `<div class="m-row"><span class="m-label">${esc(label)} kernel</span>`
+            + `<span class="m-value"><a class="krn" data-board="${esc(bd)}" data-hash="${esc(hash)}" href="#${esc(bd)}">${esc(hash)} …</a></span></div>`;
+        }
+        html += "</div></div>";
+      }
       host.innerHTML = html;
+      resolveKernelLinks();
     }
 
     function fmtDate(iso) {
@@ -477,6 +498,34 @@
 
     function esc(s) {
       return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    // Cache of other boards' entries, used to resolve a run's kernel links to the
+    // specific kernel-leaderboard row that shares its source hash.
+    const boardCache = {};
+    async function ensureBoard(b) {
+      if (boardCache[b]) return boardCache[b];
+      try {
+        const r = await fetch(`${API}/api/${b}`, { cache: "no-store" });
+        const d = await r.json();
+        boardCache[b] = Array.isArray(d.entries) ? d.entries : [];
+      } catch { boardCache[b] = []; }
+      return boardCache[b];
+    }
+    async function resolveKernelLinks() {
+      for (const a of document.querySelectorAll("a.krn")) {
+        const { board, hash } = a.dataset;
+        const entries = await ensureBoard(board);
+        const m = entries.find((en) => (en.id || "").includes(hash));
+        if (m) {
+          a.setAttribute("href", "#" + board + "/" + encodeURIComponent(m.id));
+          a.textContent = (m.name || m.id) + " →";
+        } else {
+          a.textContent = hash + " (not benchmarked yet)";
+          a.removeAttribute("href");
+          a.style.color = "var(--fg-mute)";
+        }
+      }
     }
 
     async function load() {

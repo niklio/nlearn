@@ -274,12 +274,24 @@ def submit_job(conf, cmd, label=""):
         f"export LEADERBOARD_URL={_lb_url}" if _lb_url else "",
         f"export LEADERBOARD_TOKEN={_lb_token}" if _lb_token else "",
     ]))
+    # Snapshot the codebase being shipped so the run links to a browsable GitHub
+    # tree. Done here (the launch machine has the clone + token); the cluster can't.
+    snap_lines = ""
+    try:
+        import code_snapshot
+        snap = code_snapshot.snapshot(os.path.dirname(os.path.abspath(__file__)), label or "run")
+        if snap:
+            snap_lines = (f"export NLEARN_RUN_COMMIT={snap['commit']}\n"
+                          f"export NLEARN_RUN_COMMIT_URL={snap['url']}")
+    except Exception:
+        pass
     script     = (
         f"#!/bin/bash\n"
         f"export PATH=/opt/homebrew/bin:$PATH\n"
         f"{hf_line}\n"
         f"{wandb_line}\n"
         f"{lb_lines}\n"
+        f"{snap_lines}\n"
         f"{iree_env_preamble(conf)}\n"   # route jobs through the IREE-Metal stack
         f"cd {conf['CLUSTER_DIR']}\n"
         f"{cmd}\n"

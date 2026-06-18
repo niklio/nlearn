@@ -112,6 +112,7 @@ class TrainingLogger:
         self._dataset = dataset
         self._flop_budget = flop_budget if flop_budget is not None else DEFAULT_FLOP_BUDGET
         self._run_name = run_name or f"run-{int(time.time())}"
+        self._prov = None  # cached codebase snapshot + kernel hashes
         self._best_val_loss = float("inf")
         self._loss_at_budget = None  # val loss captured when total_flops crosses budget
         self._last_train_loss = None
@@ -142,13 +143,49 @@ class TrainingLogger:
             "dataset": self._dataset,
         }
 
+    def _provenance(self):
+        """Codebase snapshot + kernel source hashes for this run, computed once.
+
+        The git snapshot needs a clone + token (present on the launch machine);
+        on the cluster the commit is passed in via NLEARN_RUN_COMMIT. Kernel
+        hashes are computed locally wherever the code runs. Best-effort: any
+        failure just omits that field (never breaks training)."""
+        if self._prov is not None:
+            return self._prov
+        prov = {}
+        commit = os.environ.get("NLEARN_RUN_COMMIT")
+        url = os.environ.get("NLEARN_RUN_COMMIT_URL")
+        if not commit:
+            try:
+                import code_snapshot
+                snap = code_snapshot.snapshot(
+                    os.path.dirname(os.path.abspath(__file__)), self._run_name)
+                if snap:
+                    commit, url = snap["commit"], snap["url"]
+            except Exception:
+                pass
+        if commit:
+            prov["commit"] = commit
+            prov["commit_url"] = url or f"https://github.com/niklio/nlearn/tree/{commit}"
+        try:
+            import bench_kernels
+            kh = bench_kernels.kernel_source_hashes()
+            if kh:
+                prov["kernels"] = kh
+        except Exception:
+            pass
+        self._prov = prov
+        return prov
+
     def _post_leaderboard(self, step, n_steps, status):
-        post_entry("pretraining", {
+        entry = {
             "id": self._run_name,
             "name": self._run_name,
             "status": status,
             "metrics": self._leaderboard_metrics(step, n_steps),
-        })
+        }
+        entry.update(self._provenance())
+        post_entry("pretraining", entry)
 
     def finalize(self, loss, step, n_steps):
         """Post the final 'done' row. Call once after the training loop."""

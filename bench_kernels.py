@@ -45,6 +45,28 @@ def _hash_files(paths):
     return h.hexdigest()[:10]
 
 
+# Source files whose content hash keys each kernel board's entry ids.
+# (Keep in sync with the per-board id construction below.)
+KERNEL_SOURCES = {
+    "flashattention": ["attention.py", "iree_metal/kernels/flash_attention.metal"],
+    "gemm": ["gemm_iree.py", "iree_metal/kernels/gemm.metal"],
+    # crossentropy is added here once its kernel source lands on disk.
+}
+
+
+def kernel_source_hashes():
+    """Map board -> source content hash for the kernels a training run uses,
+    matching the {hash} embedded in that board's leaderboard entry ids. Only
+    includes boards whose source files are all present. Stdlib-only (no jax),
+    safe to call from the training logger."""
+    out = {}
+    for board, rels in KERNEL_SOURCES.items():
+        paths = [os.path.join(HERE, *r.split("/")) for r in rels]
+        if all(os.path.exists(p) for p in paths):
+            out[board] = _hash_files(paths)
+    return out
+
+
 def _peak_mem_mb():
     # ru_maxrss is bytes on macOS, KB on Linux.
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
