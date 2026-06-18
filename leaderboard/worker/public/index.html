@@ -128,15 +128,11 @@
     .back:hover { color: var(--accent); }
     .detail-name { font-size: 1.4rem; font-weight: 650; letter-spacing: -0.02em; }
     .detail-sub { color: var(--fg-mute); font-family: var(--mono); font-size: 0.78rem; margin-top: 9px; line-height: 1.5; }
-    .metric-grid {
-      display: grid; gap: 10px; margin-top: 22px;
-      grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
-    }
-    .metric { background: var(--bg-soft); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
-    .metric.primary { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
-    .m-label { color: var(--fg-mute); font-family: var(--mono); font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; }
-    .m-value { color: var(--fg); font-family: var(--mono); font-size: 1.1rem; font-variant-numeric: tabular-nums; margin-top: 8px; word-break: break-word; }
-    .metric.primary .m-value { color: var(--accent); }
+    .metrics { margin-top: 20px; max-width: 540px; }
+    .m-row { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+    .m-row:last-child { border-bottom: 0; }
+    .m-label { color: var(--fg-mute); font-family: var(--mono); font-size: 0.82rem; }
+    .m-value { color: var(--fg); font-family: var(--mono); font-size: 0.9rem; font-variant-numeric: tabular-nums; text-align: right; word-break: break-word; }
 
     .empty, .err-msg { color: var(--fg-mute); font-family: var(--mono); text-align: center; padding: 48px 12px; font-size: 0.82rem; }
     .err-msg { color: var(--err); }
@@ -451,7 +447,7 @@
       for (const c of spec.columns) {
         const raw = cell(e, c.key);
         const v = c.fmt ? c.fmt(raw) : raw;
-        metrics.push({ label: c.label, value: v == null ? "—" : String(v), primary: !!c.primary });
+        metrics.push({ label: c.label, value: v == null ? "—" : String(v) });
       }
       // Run metadata after the board's own metrics.
       metrics.push({ label: "Status", value: e.status || "—" });
@@ -461,11 +457,9 @@
       let html = backBtn;
       html += `<div class="detail-head"><span class="detail-name">${esc(e.name || e.id)}</span> ${badge}`
         + `<div class="detail-sub">${esc(spec.label)} · rank #${idx + 1} of ${entries.length} · updated ${esc(fmtDate(e.updated_at))}</div></div>`;
-      html += '<div class="metric-grid">';
+      html += '<div class="metrics">';
       for (const m of metrics) {
-        html += `<div class="metric${m.primary ? " primary" : ""}">`
-          + `<div class="m-label">${esc(m.label)}</div>`
-          + `<div class="m-value">${esc(m.value)}</div></div>`;
+        html += `<div class="m-row"><span class="m-label">${esc(m.label)}</span><span class="m-value">${esc(m.value)}</span></div>`;
       }
       html += "</div>";
       host.innerHTML = html;
