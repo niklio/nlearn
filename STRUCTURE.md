@@ -92,11 +92,11 @@ nlearn/
 | a Metal kernel, compiler patch, plugin code | `iree_metal/` |
 | a produced log/checkpoint/dataset | leave it gitignored; don't commit |
 
-## Known hazard: two working copies
+## Single working tree
 
-`~/nlearn` is the **agent working copy** (no `.git`, where runs happen and artifacts
-pile up). `~/nlearn-git` is the **canonical git clone**. They drift. Notably some core
-modules used by `train.py` — `ce_iree.py`, `data.py`, `tokenizer.py` — are currently
-**untracked / missing from the git repo**, and this reorg (the `scripts/ bench/ tools/`
-split) was done in `~/nlearn`. To make it canonical, reconcile into `~/nlearn-git`:
-add the untracked core modules and mirror the directory moves there.
+`~/nlearn` is the one and only working tree **and** git repo (remote
+`github.com/niklio/nlearn`, branch `main`). Do all work here. The former
+`~/nlearn-git` clone has been reconciled in and deleted — there is no second copy
+to keep in sync. (History note: `ce_iree.py`, `data.py`, `tokenizer.py`, and
+`iree_metal/kernels/cross_entropy.metal` were untracked before the reconciliation;
+they are committed now.)
