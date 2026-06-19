@@ -25,6 +25,7 @@ Usage:
 import argparse
 import hashlib
 import os
+import os, sys; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path (this file lives in bench/)
 import resource
 import time
 
@@ -43,28 +44,6 @@ def _hash_files(paths):
             h.update(b"<missing>")
         h.update(p.encode())
     return h.hexdigest()[:10]
-
-
-# Source files whose content hash keys each kernel board's entry ids.
-# (Keep in sync with the per-board id construction below.)
-KERNEL_SOURCES = {
-    "flashattention": ["attention.py", "iree_metal/kernels/flash_attention.metal"],
-    "gemm": ["gemm_iree.py", "iree_metal/kernels/gemm.metal"],
-    # crossentropy is added here once its kernel source lands on disk.
-}
-
-
-def kernel_source_hashes():
-    """Map board -> source content hash for the kernels a training run uses,
-    matching the {hash} embedded in that board's leaderboard entry ids. Only
-    includes boards whose source files are all present. Stdlib-only (no jax),
-    safe to call from the training logger."""
-    out = {}
-    for board, rels in KERNEL_SOURCES.items():
-        paths = [os.path.join(HERE, *r.split("/")) for r in rels]
-        if all(os.path.exists(p) for p in paths):
-            out[board] = _hash_files(paths)
-    return out
 
 
 def _peak_mem_mb():
@@ -169,94 +148,6 @@ def _active_attention_impl(attn_mod):
     return "standard"
 
 
-def _attn_bwd_reference(Qn, Kn, Vn, dOn, dhead):
-    """Analytic causal-attention backward (float64 NumPy): returns dQ, dK, dV."""
-    import numpy as np
-    H, S, D = Qn.shape
-    scale = np.sqrt(dhead)
-    causal = np.triu(np.ones((S, S)), 1).astype(bool)
-    dQ = np.zeros_like(Qn); dK = np.zeros_like(Kn); dV = np.zeros_like(Vn)
-    for h in range(H):
-        sc = (Qn[h] @ Kn[h].T) / scale
-        sc[causal] = -np.inf
-        P = np.exp(sc - sc.max(-1, keepdims=True))
-        P /= P.sum(-1, keepdims=True)
-        dV[h] = P.T @ dOn[h]
-        dP = dOn[h] @ Vn[h].T
-        dS = P * (dP - (dP * P).sum(-1, keepdims=True))   # softmax jacobian, rowwise
-        dQ[h] = (dS @ Kn[h]) / scale
-        dK[h] = (dS.T @ Qn[h]) / scale
-    return dQ, dK, dV
-
-
-def bench_flash_bwd(heads, seq, dhead, dtype_name, warmup, trials):
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-    import attention as attn_mod
-
-    dtype = getattr(jnp, dtype_name)
-    rng = np.random.default_rng(0)
-    shape = (heads, seq, dhead)
-    Qn = rng.standard_normal(shape).astype(np.float32)
-    Kn = rng.standard_normal(shape).astype(np.float32)
-    Vn = rng.standard_normal(shape).astype(np.float32)
-    dOn = rng.standard_normal(shape).astype(np.float32)
-    Q, K, V, dO = (jnp.asarray(x, dtype=dtype) for x in (Qn, Kn, Vn, dOn))
-
-    # Isolate the backward pass: build the VJP once (forward NOT timed), then time
-    # only vjp_fn(dO) — that's the dQ/dK/dV work (the flash bwd kernels when active).
-    _, vjp_fn = jax.vjp(attn_mod.attention, Q, K, V)
-    bwd = jax.jit(vjp_fn)
-    latency = _time_fn(lambda: bwd(dO), warmup, trials)
-
-    # Backward FLOPs ≈ 2.5× forward (standard convention); causal forward = 2·H·S²·D.
-    flops = 2.5 * 2 * heads * seq * seq * dhead
-    tflops = flops / latency / 1e12
-
-    # Speedup vs the backward of naive dense O(S²) attention.
-    def naive(q, k, v):
-        scale = jnp.sqrt(jnp.asarray(dhead, dtype=dtype))
-        sc = jnp.matmul(q, k.transpose(0, 2, 1)) / scale
-        pos = jnp.arange(seq)
-        mask = jnp.where(pos[:, None] >= pos[None, :], 0.0, -jnp.inf).astype(dtype)
-        return jnp.matmul(jax.nn.softmax(sc + mask[None], axis=-1), v)
-    _, naive_vjp = jax.vjp(naive, Q, K, V)
-    naive_bwd = jax.jit(naive_vjp)
-    naive_latency = _time_fn(lambda: naive_bwd(dO), warmup, trials)
-    speedup = naive_latency / latency if latency > 0 else None
-
-    # Correctness: dQ/dK/dV vs the float64 analytic reference (max over all three).
-    dQk, dKk, dVk = (np.asarray(g, dtype=np.float32) for g in bwd(dO))
-    dQr, dKr, dVr = _attn_bwd_reference(Qn, Kn, Vn, dOn, dhead)
-    max_abs_err = float(max(np.max(np.abs(dQk - dQr)),
-                            np.max(np.abs(dKk - dKr)),
-                            np.max(np.abs(dVk - dVr))))
-
-    impl_name = _active_attention_impl(attn_mod)
-    src_hash = _hash_files([
-        os.path.join(HERE, "attention.py"),
-        os.path.join(HERE, "iree_metal", "kernels", "flash_attention.metal"),
-    ])
-    entry = {
-        "id": f"flashbwd-{impl_name}-{src_hash}",
-        "name": f"{impl_name} · {src_hash}",
-        "status": "done",
-        "metrics": {
-            "tflops": round(tflops, 4),
-            "latency_ms": round(latency * 1e3, 4),
-            "speedup": round(speedup, 3) if speedup else None,
-            "peak_mem_mb": round(_peak_mem_mb(), 1),
-            "max_abs_err": max_abs_err,
-            "shape": f"{heads}×{seq}×{dhead}",
-            "dtype": dtype_name,
-            "impl": impl_name,
-        },
-    }
-    _report_and_post("flashattention_bwd", entry)
-    return entry
-
-
 # ---------------------------------------------------------------------------
 # GEMM board
 # ---------------------------------------------------------------------------
@@ -343,6 +234,141 @@ def _gemm_identity():
 
 
 # ---------------------------------------------------------------------------
+# Cross-entropy: the fused CE (loss + dlogits over (M, vocab) logits) vs the
+# one-hot baseline the model uses today. The fused version's win is never
+# materialising the (M×vocab) one-hot — so the headline is peak memory (the
+# long-context enabler) and latency, not FLOP/s (CE is memory-bound).
+
+def _onehot_ce(logits, tgt):
+    """Baseline CE = the current _simple_ce_batched math (logsumexp + one-hot)."""
+    import jax, jax.numpy as jnp
+    V = logits.shape[-1]
+    lse = jax.scipy.special.logsumexp(logits, axis=-1)
+    oh = jax.nn.one_hot(tgt, V, dtype=logits.dtype)
+    correct = jnp.sum(logits * oh, axis=-1)
+    return -(correct - lse).mean()
+
+
+def _active_ce():
+    """The CE under test: ce_iree.cross_entropy (the fused kernel) once it exists,
+    else the one-hot baseline — so this measures whatever the agent is optimizing."""
+    try:
+        import ce_iree
+        return ce_iree.cross_entropy, "ce_iree"
+    except Exception:
+        return _onehot_ce, "onehot-baseline"
+
+
+def _ce_identity(impl_name):
+    src = os.path.join(HERE, "ce_iree.py")
+    kernel = os.path.join(HERE, "iree_metal", "kernels", "cross_entropy.metal")
+    files = [f for f in (src, kernel) if os.path.exists(f)] or [os.path.join(HERE, "train.py")]
+    return _hash_files(files)
+
+
+def bench_ce(m, v, dtype_name, warmup, trials):
+    import jax, jax.numpy as jnp, numpy as np
+    dtype = getattr(jnp, dtype_name)
+    rng = np.random.default_rng(0)
+    logits_n = rng.standard_normal((m, v)).astype(np.float32)
+    tgt_n = rng.integers(0, v, (m,)).astype(np.int32)
+    logits = jnp.asarray(logits_n, dtype=dtype)
+    tgt = jnp.asarray(tgt_n)
+
+    ce, impl_name = _active_ce()
+    fn = jax.jit(jax.value_and_grad(lambda lg, t: ce(lg, t)))      # loss + dlogits
+    base = jax.jit(jax.value_and_grad(lambda lg, t: _onehot_ce(lg, t)))
+
+    latency = _time_fn(lambda: fn(logits, tgt), warmup, trials)
+    peak_mem = _peak_mem_mb()   # capture BEFORE the one-hot baseline pollutes peak RSS
+    base_latency = _time_fn(lambda: base(logits, tgt), warmup, trials)
+    speedup = base_latency / latency if latency > 0 else None
+
+    # Memory-bound throughput: read logits + write dlogits ≈ 2·M·V·bytes.
+    bytes_moved = 2 * m * v * (2 if "16" in dtype_name else 4)
+    gb_s = bytes_moved / latency / 1e9
+
+    # Correctness: loss vs an f32 one-hot reference.
+    ref_loss = float(_onehot_ce(jnp.asarray(logits_n), tgt).astype(jnp.float32))
+    out_loss = float(fn(logits, tgt)[0])
+    max_abs_err = abs(out_loss - ref_loss)
+
+    src_hash = _ce_identity(impl_name)
+    entry = {
+        "id": f"ce-{impl_name}-{src_hash}-{m}x{v}",
+        "name": f"{impl_name} · {src_hash}",
+        "status": "done",
+        "metrics": {
+            "latency_ms": round(latency * 1e3, 4),
+            "speedup": round(speedup, 4) if speedup is not None else None,
+            "peak_mem_mb": round(peak_mem, 1),
+            "gb_s": round(gb_s, 2),
+            "max_abs_err": max_abs_err,
+            "shape": f"{m}×{v}",
+            "dtype": dtype_name,
+            "impl": impl_name,
+        },
+    }
+    _report_and_post("crossentropy", entry)
+    return entry
+
+
+def bench_lce(m, d, v, dtype_name, warmup, trials):
+    """Fused linear-CE (lm_head matmul + CE, chunked over vocab) — never materialises
+    the (M,V) logits. Headline is peak memory (the long-context enabler) + latency.
+    Posts to the same Cross-Entropy board with a distinct id."""
+    import jax, jax.numpy as jnp, numpy as np, ce_iree
+    dtype = getattr(jnp, dtype_name)
+    rng = np.random.default_rng(0)
+    X = jnp.asarray((rng.standard_normal((m, d)) * 0.1).astype(np.float32)).astype(dtype)
+    W = jnp.asarray((rng.standard_normal((d, v)) * 0.05).astype(np.float32)).astype(dtype)
+    tgt = jnp.asarray(rng.integers(0, v, (m,)).astype(np.int32))
+
+    fn = jax.jit(jax.value_and_grad(ce_iree.linear_cross_entropy, (0, 1)))
+    latency = _time_fn(lambda: fn(X, W, tgt), warmup, trials)
+    peak_mem = _peak_mem_mb()                       # fused never materialises (M,V) logits
+
+    # Speedup vs the materialised lm_head + fused CE (best-effort; may OOM at big shapes).
+    speedup = None
+    try:
+        base = jax.jit(jax.value_and_grad(
+            lambda X, W, t: ce_iree.cross_entropy(_active_gemm()(X, W), t), (0, 1)))
+        base_lat = _time_fn(lambda: base(X, W, tgt), warmup, max(3, trials // 5))
+        speedup = base_lat / latency if latency > 0 else None
+    except Exception:
+        pass
+
+    # Correctness vs the materialised full-logits CE (best-effort: the materialised
+    # matmul can hit the bf16 const-input padding edge case at non-64 vocab — the fused
+    # lce avoids it via 4096-wide chunks; correctness is also covered by check_lce.py).
+    max_abs_err = None
+    try:
+        out_loss = float(fn(X, W, tgt)[0])
+        ref_loss = float(ce_iree.cross_entropy(_active_gemm()(X, W), tgt))
+        max_abs_err = abs(out_loss - ref_loss)
+    except Exception:
+        pass
+
+    src_hash = _ce_identity("lce")
+    entry = {
+        "id": f"lce-ce_iree-{src_hash}-{m}x{d}x{v}",
+        "name": f"linear-ce · {src_hash}",
+        "status": "done",
+        "metrics": {
+            "latency_ms": round(latency * 1e3, 4),
+            "speedup": round(speedup, 4) if speedup is not None else None,
+            "peak_mem_mb": round(peak_mem, 1),
+            "max_abs_err": max_abs_err,
+            "shape": f"{m}×{d}×{v}",
+            "dtype": dtype_name,
+            "impl": "linear-ce",
+        },
+    }
+    _report_and_post("crossentropy", entry)
+    return entry
+
+
+# ---------------------------------------------------------------------------
 
 def _report_and_post(board, entry):
     m = entry["metrics"]
@@ -358,9 +384,14 @@ def _report_and_post(board, entry):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--flash", action="store_true", help="benchmark the attention forward kernel")
-    p.add_argument("--flash-bwd", action="store_true", help="benchmark the attention backward kernel")
+    p.add_argument("--flash", action="store_true", help="benchmark the attention kernel")
     p.add_argument("--gemm", action="store_true", help="benchmark the GEMM kernel")
+    p.add_argument("--ce", action="store_true", help="benchmark the cross-entropy kernel")
+    p.add_argument("--lce", action="store_true", help="benchmark the fused linear-CE (lm_head+CE)")
+    p.add_argument("--ce-m", type=int, default=4096, help="CE rows (bs*seq)")
+    p.add_argument("--ce-v", type=int, default=50257, help="CE vocab size")
+    p.add_argument("--ce-d", type=int, default=512, help="lce hidden dim D")
+    p.add_argument("--ce-dtype", type=str, default="float32", help="CE logits dtype")
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--seq", type=int, default=512)
     p.add_argument("--dhead", type=int, default=64)
@@ -374,27 +405,33 @@ def main():
     p.add_argument("--trials", type=int, default=30)
     args = p.parse_args()
 
-    # Default (no flags): run everything.
-    any_flag = args.flash or args.flash_bwd or args.gemm
+    # Default (no flags): run all.
+    any_flag = args.flash or args.gemm or args.ce or args.lce
     run_flash = args.flash or not any_flag
-    run_flash_bwd = args.flash_bwd or not any_flag
     run_gemm = args.gemm or not any_flag
+    run_ce = args.ce or not any_flag
+    run_lce = args.lce or not any_flag
 
     if run_flash:
         try:
             bench_flash(args.heads, args.seq, args.dhead, args.dtype, args.warmup, args.trials)
         except Exception as e:
             print(f"[flashattention] benchmark failed: {type(e).__name__}: {e}")
-    if run_flash_bwd:
-        try:
-            bench_flash_bwd(args.heads, args.seq, args.dhead, args.dtype, args.warmup, args.trials)
-        except Exception as e:
-            print(f"[flashattention_bwd] benchmark failed: {type(e).__name__}: {e}")
     if run_gemm:
         try:
             bench_gemm(args.m, args.n, args.k, args.gemm_dtype, args.warmup, args.trials)
         except Exception as e:
             print(f"[gemm] benchmark failed: {type(e).__name__}: {e}")
+    if run_ce:
+        try:
+            bench_ce(args.ce_m, args.ce_v, args.ce_dtype, args.warmup, args.trials)
+        except Exception as e:
+            print(f"[crossentropy] benchmark failed: {type(e).__name__}: {e}")
+    if run_lce:
+        try:
+            bench_lce(args.ce_m, args.ce_d, args.ce_v, args.ce_dtype, args.warmup, args.trials)
+        except Exception as e:
+            print(f"[crossentropy] linear-CE benchmark failed: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

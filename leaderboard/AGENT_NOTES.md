@@ -16,7 +16,7 @@ Posting is a silent no-op if these are unset, so it never breaks training.
 ## How posting works (already wired)
 - `leaderboard_client.py` (repo root) — `post_entry(board, entry)` posts to
   `/api/nlearn/<board>`. Used by `logging_utils.py` (pretraining runs) and
-  `bench_kernels.py` (kernel boards). No code change needed to use it.
+  `bench/bench_kernels.py` (kernel boards). No code change needed to use it.
 - Boards: `pretraining`, `flashattention`, `gemm`, `crossentropy`.
 - Provenance (codebase snapshot link + kernel-version links) rides along as entry
   fields (`commit_url`, `kernels`) — still works; the service stores and renders them.

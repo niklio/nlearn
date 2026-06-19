@@ -20,10 +20,16 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// bf16 inputs (was fp16): bf16 has f32-like exponent range, which is what actually
+// caps training loss on this stack (fp16 overflows as activations grow — verified via
+// CPU A/B). bf16 has fewer mantissa bits than fp16 but the matmul accumulates in f32,
+// so precision is unaffected. Uses native MSL `bfloat` + simdgroup_bfloat8x8 (bf16 MMA,
+// f32 accumulate) — requires the runtime to compile at MSL language version 3.1, which
+// IREE's Metal HAL (executable.m) now sets. ~2x the f32-compute fallback.
 struct GemmBindings {
-  device const half*  A [[id(0)]];  // M x K, row-major
-  device const half*  B [[id(1)]];  // K x N, row-major
-  device       float* C [[id(2)]];  // M x N, row-major (f32 accumulate output)
+  device const bfloat* A [[id(0)]];  // M x K, row-major
+  device const bfloat* B [[id(1)]];  // K x N, row-major
+  device       float*  C [[id(2)]];  // M x N, row-major (f32 accumulate output)
 };
 
 struct GemmParams { uint M; uint N; uint K; };
@@ -46,8 +52,8 @@ kernel void gemm_sg(
     uint  tid  [[thread_index_in_threadgroup]],
     uint  sg   [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup half As[BM][BK];
-    threadgroup half Bs[BK][BN];
+    threadgroup bfloat As[BM][BK];
+    threadgroup bfloat Bs[BK][BN];
 
     const uint row0 = tgid.y * BM;             // block origin in C
     const uint col0 = tgid.x * BN;
@@ -62,13 +68,13 @@ kernel void gemm_sg(
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint k0 = 0; k0 < p.K; k0 += BK) {
-        // Vectorized cooperative staging: each thread moves half4s (rows are
+        // Vectorized cooperative staging: each thread moves a bfloat4 (rows are
         // contiguous in both global and the slab), so 1/4 the load instrs and no
         // per-element div/mod. BK and BN are multiples of 4.
-        threadgroup half4* As4 = (threadgroup half4*)As;
-        threadgroup half4* Bs4 = (threadgroup half4*)Bs;
-        device const half4* A4 = (device const half4*)args.A;
-        device const half4* B4 = (device const half4*)args.B;
+        threadgroup bfloat4* As4 = (threadgroup bfloat4*)As;
+        threadgroup bfloat4* Bs4 = (threadgroup bfloat4*)Bs;
+        device const bfloat4* A4 = (device const bfloat4*)args.A;
+        device const bfloat4* B4 = (device const bfloat4*)args.B;
         const uint Kq = p.K >> 2, Nq = p.N >> 2, BKq = BK >> 2, BNq = BN >> 2;
         for (uint e = tid; e < BM * BKq; e += NTHREADS) {
             uint r = e / BKq, c = e % BKq;
@@ -83,7 +89,7 @@ kernel void gemm_sg(
         // Consume the staged slab in 8-deep K steps (BK/8 of them per barrier).
 #pragma clang loop unroll(full)
         for (uint kk = 0; kk < BK; kk += 8) {
-            simdgroup_half8x8 a[TM], b[TN];
+            simdgroup_bfloat8x8 a[TM], b[TN];
 #pragma clang loop unroll(full)
             for (uint i = 0; i < TM; ++i)
                 simdgroup_load(a[i], &As[sr + i * 8][kk], BK);

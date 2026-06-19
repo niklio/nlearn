@@ -2,9 +2,16 @@ __pycache__/
 checkpoints/
 wandb/
 datasets/
+logs/
+.iree_runtime/
+.claude/scheduled_tasks.lock
+.DS_Store
 .cluster.conf
 .cluster_ready
 tokenizer.json
 
 # leaderboard
 .leaderboard_bench.log
+leaderboard/worker/.dev.vars
+leaderboard/worker/.wrangler/
+leaderboard/worker/node_modules/

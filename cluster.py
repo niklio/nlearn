@@ -114,6 +114,8 @@ def iree_env_preamble(conf):
         f"export NLEARN_IREE_PLUGIN_DYLIB={bundle}/pjrt_plugin_iree_metal.dylib",
         f"export IREE_PJRT_COMPILER_LIB_PATH={bundle}/libIREECompiler.dylib",
         f"export NLEARN_FLASH_KERNEL_PATH={d}/iree_metal/kernels/flash_attention.metal",
+        f"export NLEARN_GEMM_KERNEL_PATH={d}/iree_metal/kernels/gemm.metal",
+        f"export NLEARN_CE_KERNEL_PATH={d}/iree_metal/kernels/cross_entropy.metal",
         # metal-compile-to-metallib=false: the mini has no `xcrun metal` tool, so
         # embed MSL source and let the Metal runtime compile it. lld serializes
         # the llvm-cpu host-helper executables the compiler emits.
@@ -274,24 +276,19 @@ def submit_job(conf, cmd, label=""):
         f"export LEADERBOARD_URL={_lb_url}" if _lb_url else "",
         f"export LEADERBOARD_TOKEN={_lb_token}" if _lb_token else "",
     ]))
-    # Snapshot the codebase being shipped so the run links to a browsable GitHub
-    # tree. Done here (the launch machine has the clone + token); the cluster can't.
-    snap_lines = ""
-    try:
-        import code_snapshot
-        snap = code_snapshot.snapshot(os.path.dirname(os.path.abspath(__file__)), label or "run")
-        if snap:
-            snap_lines = (f"export NLEARN_RUN_COMMIT={snap['commit']}\n"
-                          f"export NLEARN_RUN_COMMIT_URL={snap['url']}")
-    except Exception:
-        pass
+    # Forward NLEARN_* tuning env (GRAD_ACCUM, WARMUP, WD, VAL_BATCHES, COMPUTE_DTYPE, …)
+    # from the submitting shell so remote runs honor the same config as local ones.
+    nlearn_lines = "\n".join(
+        f"export {k}={shlex.quote(v)}"
+        for k, v in sorted(os.environ.items()) if k.startswith("NLEARN_")
+    )
     script     = (
         f"#!/bin/bash\n"
         f"export PATH=/opt/homebrew/bin:$PATH\n"
         f"{hf_line}\n"
         f"{wandb_line}\n"
         f"{lb_lines}\n"
-        f"{snap_lines}\n"
+        f"{nlearn_lines}\n"
         f"{iree_env_preamble(conf)}\n"   # route jobs through the IREE-Metal stack
         f"cd {conf['CLUSTER_DIR']}\n"
         f"{cmd}\n"

@@ -1,0 +1,25 @@
+diff --git a/runtime/src/iree/hal/drivers/metal/executable.m b/runtime/src/iree/hal/drivers/metal/executable.m
+index 4de38c9..bc8c3a3 100644
+--- a/runtime/src/iree/hal/drivers/metal/executable.m
++++ b/runtime/src/iree/hal/drivers/metal/executable.m
+@@ -195,10 +195,18 @@ static iree_status_t iree_hal_metal_compile_source(id<MTLDevice> device,
+   id<MTLLibrary> library = nil;
+   @autoreleasepool {
+     MTLCompileOptions* compile_options = [[MTLCompileOptions new] autorelease];
++    // 3.1 (was 3.0) so hand-authored MSL can use the `bfloat` type + simdgroup_bfloat8x8
++    // (bf16 matmul with f32 accumulate) — used by the custom GEMM for wide-range, fast
++    // matmuls. macOS 14+/M3 supports it; fall back to 3.0 on older OSes.
+     compile_options.languageVersion = MTLLanguageVersion3_0;
++    if (@available(macOS 14.0, iOS 17.0, *)) {
++      compile_options.languageVersion = MTLLanguageVersion3_1;
++    }
+     if (iree_hal_metal_MSLSourceDef_version_is_present(source_def)) {
+-      compile_options.languageVersion =
+-          (MTLLanguageVersion)iree_hal_metal_MSLSourceDef_version_get(source_def);
++      // Only RAISE the version — never drop below our 3.1 default, else hand-authored
++      // MSL using `bfloat` (which the pipeline tags as 3.0) fails to compile.
++      MTLLanguageVersion v = (MTLLanguageVersion)iree_hal_metal_MSLSourceDef_version_get(source_def);
++      if (v > compile_options.languageVersion) compile_options.languageVersion = v;
+     }
+ 
+     flatbuffers_string_t code = iree_hal_metal_MSLSourceDef_code_get(source_def);

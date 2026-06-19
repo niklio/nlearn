@@ -18,18 +18,27 @@ from leaderboard_client import post_entry
 DEFAULT_FLOP_BUDGET = float(os.environ.get("LEADERBOARD_FLOP_BUDGET", 1e16))
 
 
-def benchmark_peak_tflops(dtype=jax.numpy.bfloat16, n=2048, warmup=3, trials=10):
+def benchmark_peak_tflops(dtype=jax.numpy.float16, n=2048, warmup=3, trials=10):
     """
-    Measure actual hardware peak TFLOPS by timing a large matmul.
+    Measure achievable peak TFLOPS by timing a large square matmul through the
+    SAME path the model uses for its matmuls.
 
-    Runs an (n × n) @ (n × n) matmul and computes throughput.
-    FLOPs for a matmul of two (n, n) matrices = 2 * n^3.
+    On IREE-Metal that means the hand-authored simdgroup GEMM kernel (~2.4-2.9
+    TFLOPS), NOT IREE's naive jnp.matmul codegen (~0.7) — otherwise MFU is computed
+    against the wrong denominator and reads >100%. Uses fp16 (bf16 is unsupported on
+    metal-spirv). MFU then means "fraction of our GEMM-kernel throughput the full
+    step sustains" — the gap below 100% is the non-GEMM overhead (flash, elementwise,
+    cross-entropy, host dispatch gaps). FLOPs for (n,n)@(n,n) = 2*n^3.
     """
     import jax.numpy as jnp
+    try:
+        from gemm_iree import matmul as _mm   # routes to the Metal GEMM kernel on IREE
+    except Exception:
+        _mm = jnp.matmul
 
     a = jnp.ones((n, n), dtype=dtype)
     b = jnp.ones((n, n), dtype=dtype)
-    matmul = jax.jit(jnp.matmul)
+    matmul = jax.jit(_mm)
 
     # Warmup: compile + fill caches
     for _ in range(warmup):
@@ -112,7 +121,6 @@ class TrainingLogger:
         self._dataset = dataset
         self._flop_budget = flop_budget if flop_budget is not None else DEFAULT_FLOP_BUDGET
         self._run_name = run_name or f"run-{int(time.time())}"
-        self._prov = None  # cached codebase snapshot + kernel hashes
         self._best_val_loss = float("inf")
         self._loss_at_budget = None  # val loss captured when total_flops crosses budget
         self._last_train_loss = None
@@ -143,49 +151,13 @@ class TrainingLogger:
             "dataset": self._dataset,
         }
 
-    def _provenance(self):
-        """Codebase snapshot + kernel source hashes for this run, computed once.
-
-        The git snapshot needs a clone + token (present on the launch machine);
-        on the cluster the commit is passed in via NLEARN_RUN_COMMIT. Kernel
-        hashes are computed locally wherever the code runs. Best-effort: any
-        failure just omits that field (never breaks training)."""
-        if self._prov is not None:
-            return self._prov
-        prov = {}
-        commit = os.environ.get("NLEARN_RUN_COMMIT")
-        url = os.environ.get("NLEARN_RUN_COMMIT_URL")
-        if not commit:
-            try:
-                import code_snapshot
-                snap = code_snapshot.snapshot(
-                    os.path.dirname(os.path.abspath(__file__)), self._run_name)
-                if snap:
-                    commit, url = snap["commit"], snap["url"]
-            except Exception:
-                pass
-        if commit:
-            prov["commit"] = commit
-            prov["commit_url"] = url or f"https://github.com/niklio/nlearn/tree/{commit}"
-        try:
-            import bench_kernels
-            kh = bench_kernels.kernel_source_hashes()
-            if kh:
-                prov["kernels"] = kh
-        except Exception:
-            pass
-        self._prov = prov
-        return prov
-
     def _post_leaderboard(self, step, n_steps, status):
-        entry = {
+        post_entry("pretraining", {
             "id": self._run_name,
             "name": self._run_name,
             "status": status,
             "metrics": self._leaderboard_metrics(step, n_steps),
-        }
-        entry.update(self._provenance())
-        post_entry("pretraining", entry)
+        })
 
     def finalize(self, loss, step, n_steps):
         """Post the final 'done' row. Call once after the training loop."""

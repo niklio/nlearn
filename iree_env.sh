@@ -26,6 +26,9 @@ export NLEARN_FLASH_KERNEL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pw
 # Absolute path to the hand-authored Metal GEMM kernel object (custom_call @gemm).
 export NLEARN_GEMM_KERNEL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/iree_metal/kernels/gemm.metal"
 
+# Absolute path to the fused cross-entropy kernel object (custom_call @ce_fwd/@ce_bwd).
+export NLEARN_CE_KERNEL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/iree_metal/kernels/cross_entropy.metal"
+
 # Quieter logs (set to debug to see compiler/driver detail).
 export IREE_PJRT_LOG_LEVEL=error
 

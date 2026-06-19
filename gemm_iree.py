@@ -45,8 +45,11 @@ def _gemm_padded(A, B):
     M, K = A.shape
     N = B.shape[1]
     Mp, Kp, Np = _ceil(M, 32), _ceil(K, 64), _ceil(N, 32)
-    Af = A.astype(jnp.float16)
-    Bf = B.astype(jnp.float16)
+    # bf16 inputs (was f16): bf16's f32-like exponent range unblocks training loss
+    # (fp16 overflowed as activations grew). The kernel accumulates in f32, so the
+    # fewer bf16 mantissa bits don't matter. gemm.metal + the dispatch pass expect bf16.
+    Af = A.astype(jnp.bfloat16)
+    Bf = B.astype(jnp.bfloat16)
     if Mp != M or Kp != K:
         Af = jnp.pad(Af, ((0, Mp - M), (0, Kp - K)))
     if Kp != K or Np != N:
@@ -67,9 +70,9 @@ def _gemm_fwd(A, B):
 
 def _gemm_bwd(res, dC):
     A, B = res
-    dCf = dC.astype(jnp.float16)
-    dA = _gemm_padded(dCf, B.T.astype(jnp.float16))   # (M,N)@(N,K) -> (M,K)
-    dB = _gemm_padded(A.T.astype(jnp.float16), dCf)   # (K,M)@(M,N) -> (K,N)
+    # _gemm_padded casts to bf16 internally; pass through in the operands' dtype.
+    dA = _gemm_padded(dC, B.T)   # (M,N)@(N,K) -> (M,K)
+    dB = _gemm_padded(A.T, dC)   # (K,M)@(M,N) -> (K,N)
     return dA.astype(A.dtype), dB.astype(B.dtype)
 
 

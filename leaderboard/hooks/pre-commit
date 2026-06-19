@@ -9,21 +9,33 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
+
+# Run the benchmark in the IREE-Metal environment when available so it measures the
+# real Metal kernels and posts with the leaderboard token. Best-effort: machines/CI
+# without these files fall back to python3 + a silent no-op post (client never raises).
+set +u
+[ -f "$ROOT/iree_env.sh" ] && . "$ROOT/iree_env.sh" >/dev/null 2>&1 || true
+[ -f "$HOME/.config/nlearn/leaderboard.env" ] && . "$HOME/.config/nlearn/leaderboard.env" >/dev/null 2>&1 || true
+set -u
+PY="${PYTHON:-}"
+[ -z "$PY" ] && [ -x "$HOME/.venvs/iree/bin/python" ] && PY="$HOME/.venvs/iree/bin/python"
+[ -z "$PY" ] && PY="python3"
+
 changed="$(git diff --cached --name-only || true)"
 
-want_flash=0; want_gemm=0
-echo "$changed" | grep -qE '^(attention\.py|iree_metal/kernels/flash)' && want_flash=1
-echo "$changed" | grep -qE '^(gemm_iree\.py|iree_metal/kernels/gemm)'  && want_gemm=1
+want_flash=0; want_gemm=0; want_ce=0
+echo "$changed" | grep -qE '^(attention\.py|iree_metal/kernels/flash)'        && want_flash=1
+echo "$changed" | grep -qE '^(gemm_iree\.py|iree_metal/kernels/gemm)'         && want_gemm=1
+echo "$changed" | grep -qE '^(ce_iree\.py|iree_metal/kernels/cross_entropy)'  && want_ce=1
 
-[ "$want_flash" -eq 0 ] && [ "$want_gemm" -eq 0 ] && exit 0
+[ "$want_flash" -eq 0 ] && [ "$want_gemm" -eq 0 ] && [ "$want_ce" -eq 0 ] && exit 0
 
 flags=""
-# Forward and backward share flash_attention.metal + attention.py, so a flash
-# change re-benchmarks both kernels.
-[ "$want_flash" -eq 1 ] && flags="$flags --flash --flash-bwd"
+[ "$want_flash" -eq 1 ] && flags="$flags --flash"
 [ "$want_gemm" -eq 1 ]  && flags="$flags --gemm"
+[ "$want_ce" -eq 1 ]    && flags="$flags --ce --lce"
 
-echo "[leaderboard] kernel change detected — benchmarking in background ($flags)"
+echo "[leaderboard] kernel change detected — benchmarking in background ($flags) via $PY"
 LOG="$ROOT/.leaderboard_bench.log"
-nohup "${PYTHON:-python3}" "$ROOT/bench_kernels.py" $flags >"$LOG" 2>&1 &
+nohup "$PY" "$ROOT/bench/bench_kernels.py" $flags >"$LOG" 2>&1 &
 exit 0

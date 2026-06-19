@@ -18,6 +18,14 @@ import tiktoken
 from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
 from attention import print_attention_config
 from logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
+from ce_iree import cross_entropy as _fused_ce
+from ce_iree import linear_cross_entropy as _fused_linear_ce
+
+# NLEARN_FUSED_LMHEAD=1 fuses lm_head + CE (chunked over vocab) so the (bs·seq, vocab)
+# logits are NEVER materialised — the long-context memory enabler (peak ~472MB vs ~1.6GB
+# at seq512). It recomputes logits in the backward, ~32% more CE-region compute, so it's
+# OFF by default (the materialised lm_head + fused CE keeps MFU higher at short seq).
+_FUSED_LMHEAD = os.environ.get("NLEARN_FUSED_LMHEAD") == "1"
 
 # ---------------------------------------------------------------------------
 # CHECKPOINTING
@@ -260,21 +268,27 @@ import attention as _attn
 
 
 def _simple_ce_batched(params, batch):
-    """Batched full-vocab cross-entropy — the whole batch in single dispatches (no
-    vmap). `batch` is (bs, seq_len+1); the model runs on (bs, seq) directly so every
-    matmul is one flattened GEMM and attention is one flash dispatch over bs·heads.
-    One-hot select (not gather) avoids the scatter miscompile on metal-spirv."""
+    """Batched full-vocab cross-entropy via the fused Metal CE kernel (ce_iree):
+    one threadgroup per (bs·seq) row streams the vocab once to produce loss + dlogits,
+    instead of materialising a (bs·seq, vocab) one-hot + ~6 memory-bound passes. ~8.6×
+    faster than the one-hot CE here and the long-context memory enabler (no (M,vocab)
+    one-hot). `cross_entropy` flattens the leading dims internally; off IREE-Metal it
+    falls back to the jnp one-hot CE."""
     input_ids  = batch[:, :-1]                              # (bs, seq)
     target_ids = batch[:, 1:]                               # (bs, seq)
+    if _FUSED_LMHEAD:
+        # Fuse lm_head + CE, chunked over vocab — never materialise (bs·seq, vocab).
+        x = model_forward_features(params, input_ids)       # (bs, seq, D_MODEL)
+        return _fused_linear_ce(x.reshape(-1, D_MODEL), params['lm_head'],
+                                target_ids.reshape(-1))
     logits = model_forward(params, input_ids)               # (bs, seq, VOCAB_SIZE)
-    log_Z  = jax.scipy.special.logsumexp(logits, axis=-1)   # (bs, seq)
-    onehot = jax.nn.one_hot(target_ids, VOCAB_SIZE, dtype=logits.dtype)
-    correct_logit = jnp.sum(logits * onehot, axis=-1)       # (bs, seq)
-    return -(correct_logit - log_Z).mean()
+    return _fused_ce(logits, target_ids)
 
 
-if _attn.USE_IREE_FLASH:
-    # IREE-Metal: batched execution (one dispatch per op), full-vocab simple CE.
+if _attn.USE_IREE_FLASH or os.environ.get("NLEARN_FORCE_BATCHED_CE") == "1":
+    # IREE-Metal (or forced, e.g. CPU f32 verification): batched execution (one
+    # dispatch per op), full-vocab simple CE. The vmap-per-sequence path below is
+    # stale after the batched refactor, so CPU runs force this path too.
     def batch_loss(params, batch):
         return _simple_ce_batched(params, batch)
 else:
@@ -321,7 +335,7 @@ def make_train_step(optimizer):
         scaled_loss, grads = jax.value_and_grad(_scaled_loss)(params, batch)
         if LOSS_SCALE != 1.0:
             grads = jax.tree_util.tree_map(lambda g: g / LOSS_SCALE, grads)
-        updates, opt_state = optimizer.update(grads, opt_state)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, scaled_loss / LOSS_SCALE
     return jax.jit(train_step)
@@ -479,12 +493,16 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
         decay_steps=eff_updates,
         end_value=peak_lr / 10,
     )
-    # Gradient clipping (global-norm): our fp16 custom-kernel gradients are noisier
-    # than jax-metal's, so lr=1e-3 diverged unclipped (loss bottomed then climbed as
-    # LR reached peak). Clipping caps the occasional large-norm step that triggers
-    # divergence, raising the stable LR ceiling toward the reference's 1e-3.
-    GRAD_CLIP = float(os.environ.get("NLEARN_GRAD_CLIP", "1.0"))
-    base = optax.adam(learning_rate=schedule)
+    # AdamW (decoupled weight decay) — the transformer-standard optimizer. WITHOUT
+    # weight decay, lr=1e-3 slowly diverged here (val bottomed ~7.53 near peak LR then
+    # climbed monotonically as weights grew unbounded) even with warmup 200, while the
+    # jax-metal reference sustained lr=1e-3 to val 5.71 — the missing regulariser, not
+    # gradient noise, was the difference. wd=0.1 is the usual GPT-ish value. Clipping is
+    # off by default: clip_by_global_norm's tree-norm emits vector.create_mask which
+    # fails to legalize on metal-spirv (set NLEARN_GRAD_CLIP>0 only off-Metal).
+    GRAD_CLIP = float(os.environ.get("NLEARN_GRAD_CLIP", "0"))
+    WEIGHT_DECAY = float(os.environ.get("NLEARN_WD", "0.1"))
+    base = optax.adamw(learning_rate=schedule, weight_decay=WEIGHT_DECAY)
     optimizer = optax.chain(optax.clip_by_global_norm(GRAD_CLIP), base) if GRAD_CLIP > 0 else base
     if GRAD_ACCUM > 1:
         optimizer = optax.MultiSteps(optimizer, every_k_schedule=GRAD_ACCUM)

@@ -1,3 +1,4 @@
+import os
 from functools import partial
 
 import jax                          # Core JAX library: handles autodiff, JIT compilation, random numbers
@@ -26,7 +27,18 @@ MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compres
 # metal-spirv target for Apple GPUs advertises fp16 but NOT bf16 (bf16 matmuls
 # fail to legalize); bf16 elsewhere (CUDA/CPU), whose wider exponent range makes
 # mixed-precision training more stable.
-COMPUTE_DTYPE = jnp.float16 if "metal" in PLATFORM else jnp.bfloat16
+# NLEARN_COMPUTE_DTYPE overrides this ("float32"/"float16"/"bfloat16") — used to test
+# whether the fp16-gradient noise from the custom GEMM caps the loss (run f32 + the
+# native matmul fallback via NLEARN_DISABLE_GEMM=1).
+_DT = {"float32": jnp.float32, "float16": jnp.float16, "bfloat16": jnp.bfloat16}
+# Default f32 on Metal: activations stay f32 (IREE handles f32 elementwise; bf16
+# activations hit a vector.bitcast legalization gap) while the custom GEMM takes the
+# matmul inputs to bf16 — wide range everywhere. Pure fp16 CAPS the loss (~7.4) because
+# its narrow exponent range overflows as activations grow (verified). bf16 elsewhere.
+COMPUTE_DTYPE = _DT.get(
+    os.environ.get("NLEARN_COMPUTE_DTYPE", ""),
+    jnp.float32 if "metal" in PLATFORM else jnp.bfloat16,
+)
 
 # ---------------------------------------------------------------------------
 # SECTION 1: EMBEDDINGS
@@ -44,20 +56,13 @@ def init_embeddings(key):
     'key' is a JAX PRNG key used to generate random initial values.
     JAX requires you to pass random keys explicitly (no global random state).
     """
-    key1, key2 = random.split(key)   # Split one key into two independent keys, one per table.
-                                     # JAX keys are immutable — you must split to get new randomness.
-
-    token_embed = random.normal(key1, (VOCAB_SIZE, D_MODEL)) * 0.02
+    token_embed = random.normal(key, (VOCAB_SIZE, D_MODEL)) * 0.02
     # random.normal draws from a Gaussian (mean=0, std=1).
     # Shape (VOCAB_SIZE, D_MODEL): one D_MODEL-dimensional vector per token.
     # We multiply by 0.02 to keep initial values small — large initial weights
     # can cause unstable training (exploding gradients).
-
-    pos_embed = random.normal(key2, (MAX_SEQ_LEN, D_MODEL)) * 0.02
-    # Same idea, but one vector per *position* (0, 1, 2, ... MAX_SEQ_LEN-1).
-    # This is how the model learns that position 0 is different from position 5.
-
-    return {'token_embed': token_embed, 'pos_embed': pos_embed}
+    # No positional table: position is handled by RoPE (rotary embeddings) on Q/K.
+    return {'token_embed': token_embed}
 
 
 def embed(params, token_ids):
@@ -67,20 +72,11 @@ def embed(params, token_ids):
     token_ids: a 1D integer array of shape (seq_len,), e.g. [72, 101, 108, ...]
     Returns:   a 2D float array of shape (seq_len, D_MODEL)
     """
-    seq_len = token_ids.shape[-1]  # tokens per sequence (token_ids is (bs, seq) or (seq,)).
-
-    tok = params['token_embed'][token_ids]
-    # Index into the token embedding table using the token IDs.
+    # Token embeddings only. Position is injected later by RoPE (rotary embeddings)
+    # applied to Q/K inside attention — no learned position table, so the model is no
+    # longer capped at MAX_SEQ_LEN and extrapolates to longer contexts.
+    return params['token_embed'][token_ids]
     # For (bs, seq) ids this yields (bs, seq, D_MODEL); for (seq,) it yields (seq, D_MODEL).
-
-    pos = params['pos_embed'][:seq_len]
-    # Slice the positional embedding table to match the sequence length.
-    # [:seq_len] takes rows 0 through seq_len-1.
-    # Result shape: (seq_len, D_MODEL)
-
-    return tok + pos
-    # Element-wise addition — each token vector gets its position information baked in.
-    # Result shape: (seq_len, D_MODEL) — this is the input to the transformer blocks.
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +126,22 @@ def init_attention(key):
     }
 
 
+def apply_rope(x, positions, base=10000.0):
+    """Rotary position embedding (RoPE) on Q or K. Rotates the two halves of each
+    head vector by position-dependent angles, so Q·K depends on RELATIVE position
+    (m−n) — giving position information with no learned table, and extrapolating to
+    any sequence length. x: (bs·heads, seq, d_head); positions: (seq,). Applied to
+    Q and K before attention; V and the flash kernel are untouched."""
+    d = x.shape[-1]
+    half = d // 2
+    inv_freq = base ** (-jnp.arange(0, half, dtype=jnp.float32) / float(half))  # (half,)
+    ang = positions[:, None].astype(jnp.float32) * inv_freq[None, :]            # (seq, half)
+    cos = jnp.cos(ang).astype(x.dtype)
+    sin = jnp.sin(ang).astype(x.dtype)
+    x1, x2 = x[..., :half], x[..., half:]                                      # (bh, seq, half)
+    return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
+
+
 def attention_forward(params, x):
     """
     Standard multi-head self-attention.
@@ -154,6 +166,11 @@ def attention_forward(params, x):
                 .transpose(0, 2, 1, 3).reshape(bh, seq_len, d_head))
 
     Q, K, V = proj(params['W_q']), proj(params['W_k']), proj(params['W_v'])
+
+    # RoPE: rotate Q and K by position (no learned table; extrapolates to any seq_len).
+    positions = jnp.arange(seq_len)
+    Q = apply_rope(Q, positions)
+    K = apply_rope(K, positions)
 
     out = attention(Q, K, V)                                # (bs·heads, seq, d_head)
     out = (out.reshape(bs, N_HEADS, seq_len, d_head)
