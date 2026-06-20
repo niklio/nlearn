@@ -105,6 +105,11 @@ def linear(x, W):
     if USE_IREE_GEMM and getattr(x, "ndim", None) is not None and x.ndim >= 2 and W.ndim == 2:
         lead = x.shape[:-1]
         K = x.shape[-1]
+        # NOTE: metal-spirv uses 32-bit buffer indices, so a single dispatch overflows
+        # when M·N gets large — for the vocab projection (N≈50k) that ceiling is the
+        # token count M ≈ 7600. Keep per-microbatch tokens (bs·seq) under that. (Token-
+        # tiling here was tried and reverted: slicing the GEMM operands miscompiles the
+        # backward on metal-spirv → NaN grads. The real fix is an M-tiled GEMM kernel.)
         y = gemm(x.reshape(-1, K), W)          # (prod(lead), N) f32 accumulate
         return y.reshape(*lead, W.shape[1]).astype(x.dtype)   # -> fp16 (mixed precision)
     return jnp.matmul(x, W)
