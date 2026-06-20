@@ -11,7 +11,7 @@ import time
 import jax
 import wandb
 
-from leaderboard_client import post_entry
+from nlearn.leaderboard import post_entry
 
 # Compute budget (in FLOPs) at which val loss is captured for ranking, so runs
 # of different lengths/speeds are compared at equal compute. Overridable via env.
@@ -32,7 +32,7 @@ def benchmark_peak_tflops(dtype=jax.numpy.float16, n=2048, warmup=3, trials=10):
     """
     import jax.numpy as jnp
     try:
-        from gemm_iree import matmul as _mm   # routes to the Metal GEMM kernel on IREE
+        from nlearn.kernels.gemm import matmul as _mm   # routes to the Metal GEMM kernel on IREE
     except Exception:
         _mm = jnp.matmul
 

@@ -9,8 +9,8 @@ import os, sys, time
 import numpy as np
 import jax, jax.numpy as jnp
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-from model import init_model, model_forward
-import train as T
+from nlearn.model import init_model, model_forward
+import nlearn.train as T
 
 BS, SEQ = 8, 512
 REPS = 20

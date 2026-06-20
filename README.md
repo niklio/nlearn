@@ -10,8 +10,9 @@ See [`iree_metal/README.md`](iree_metal/README.md) for the IREE-Metal setup and
 wired into JAX (the custom_call → `flow.dispatch` compiler pass + `custom_vjp`).
 
 **Repository layout & conventions:** see [`STRUCTURE.md`](STRUCTURE.md) — directory
-map and the rules for where new files go (core library stays flat at root; ops
-scripts in `scripts/`, benchmarks in `bench/`, utilities in `tools/`).
+map and the rules for where new files go. The core library is the `nlearn/` package
+(`python -m nlearn.train`); ops scripts in `scripts/`, benchmarks in `bench/`,
+utilities in `tools/`.
 
 ---
 

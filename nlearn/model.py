@@ -5,9 +5,9 @@ import jax                          # Core JAX library: handles autodiff, JIT co
 import jax.numpy as jnp              # JAX's version of NumPy — same API but runs on GPU/TPU and supports autodiff
 from jax import random               # JAX's random number module (different from Python's random — must pass keys explicitly)
 
-from attention import attention, PLATFORM  # Cross-platform attention dispatch (see attention.py)
-from gemm_iree import matmul as gemm_matmul  # custom Metal GEMM on IREE-Metal, else jnp.matmul
-from gemm_iree import linear                 # batched x[...,K]@W[K,N] as one flattened GEMM
+from nlearn.attention import attention, PLATFORM  # Cross-platform attention dispatch (see attention.py)
+from nlearn.kernels.gemm import matmul as gemm_matmul  # custom Metal GEMM on IREE-Metal, else jnp.matmul
+from nlearn.kernels.gemm import linear                 # batched x[...,K]@W[K,N] as one flattened GEMM
 
 # ---------------------------------------------------------------------------
 # HYPERPARAMETERS

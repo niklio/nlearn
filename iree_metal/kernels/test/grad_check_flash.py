@@ -7,8 +7,8 @@ import os, sys
 import numpy as np
 import jax, jax.numpy as jnp
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-from gemm_iree import gemm
-from attention import _attention_iree_flash
+from nlearn.kernels.gemm import gemm
+from nlearn.attention import _attention_iree_flash
 
 N, S, D = 64, 512, 64
 scale = 1.0 / (D ** 0.5)

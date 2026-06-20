@@ -15,11 +15,11 @@ from datasets import load_dataset
 
 import tiktoken
 
-from model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
-from attention import print_attention_config
-from logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
-from ce_iree import cross_entropy as _fused_ce
-from ce_iree import linear_cross_entropy as _fused_linear_ce
+from nlearn.model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
+from nlearn.attention import print_attention_config
+from nlearn.logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
+from nlearn.kernels.cross_entropy import cross_entropy as _fused_ce
+from nlearn.kernels.cross_entropy import linear_cross_entropy as _fused_linear_ce
 
 # NLEARN_FUSED_LMHEAD=1 fuses lm_head + CE (chunked over vocab) so the (bs·seq, vocab)
 # logits are NEVER materialised — the long-context memory enabler (peak ~472MB vs ~1.6GB
@@ -264,7 +264,7 @@ def _simple_cross_entropy_loss(params, token_ids):
     return -(correct_logit - log_Z).mean()
 
 
-import attention as _attn
+import nlearn.attention as _attn
 
 
 def _simple_ce_batched(params, batch):

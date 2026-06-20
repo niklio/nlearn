@@ -6,7 +6,7 @@ import os, sys
 import numpy as np
 import jax, jax.numpy as jnp
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-from gemm_iree import gemm
+from nlearn.kernels.gemm import gemm
 import ml_dtypes  # for a numpy bf16 reference
 
 def check(M, K, N, scale, label):

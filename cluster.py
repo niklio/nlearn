@@ -407,7 +407,7 @@ def cmd_generate(args, conf):
         f"export PATH=/opt/homebrew/bin:$PATH; "
         f"{hf_env}"
         f"{preamble}; "
-        f"cd {conf['CLUSTER_DIR']} && {VENV_PY} -u generate.py {args_str}"
+        f"cd {conf['CLUSTER_DIR']} && {VENV_PY} -u -m nlearn.generate {args_str}"
     )
     # -t allocates a pseudo-TTY so Ctrl-C propagates to the remote process
     subprocess.run(["ssh", "-t", ssh_target(conf), full_cmd])
@@ -417,7 +417,7 @@ def cmd_train(args, conf):
     """Submit a training job and surface the W&B run URL."""
     ensure_ready(conf)
     args_str = " ".join(shlex.quote(a) for a in args)
-    cmd      = f"{VENV_PY} -u train.py {args_str}"
+    cmd      = f"{VENV_PY} -u -m nlearn.train {args_str}"
     label    = f"train {args_str}".strip()
 
     print(f"Submitting: {cmd}")
@@ -438,14 +438,19 @@ def cmd_train(args, conf):
 def cmd_submit(script, args, conf):
     """Generic queued submission for scripts other than train/generate."""
     ensure_ready(conf)
-    if   (REPO_ROOT / f"{script}.py").exists():
-        cmd = f"{VENV_PY} -u {script}.py"
-    elif (REPO_ROOT / f"{script}.sh").exists():
-        cmd = f"bash {script}.sh"
-    elif (REPO_ROOT / script).is_file() and os.access(REPO_ROOT / script, os.X_OK):
-        cmd = f"./{script}"
-    else:
-        die(f"Error: no '{script}', '{script}.py', or '{script}.sh' found in repo root.")
+    # Search the repo root and the script subdirs (scripts/, bench/, tools/).
+    cmd = None
+    for d in ("", "scripts", "bench", "tools"):
+        base = REPO_ROOT / d if d else REPO_ROOT
+        pre  = f"{d}/" if d else ""
+        if (base / f"{script}.py").exists():
+            cmd = f"{VENV_PY} -u {pre}{script}.py"; break
+        if (base / f"{script}.sh").exists():
+            cmd = f"bash {pre}{script}.sh"; break
+        if (base / script).is_file() and os.access(base / script, os.X_OK):
+            cmd = f"./{pre}{script}"; break
+    if cmd is None:
+        die(f"Error: no '{script}[.py|.sh]' found in repo root, scripts/, bench/, or tools/.")
 
     args_str = " ".join(shlex.quote(a) for a in args)
     full_cmd = f"{cmd} {args_str}".strip()

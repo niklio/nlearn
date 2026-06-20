@@ -7,10 +7,9 @@ import os, sys
 import numpy as np
 import jax, jax.numpy as jnp
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-import ce_iree
-from model import init_model, model_forward_features, model_forward, D_MODEL, VOCAB_SIZE
-import gemm_iree
-
+import nlearn.kernels.cross_entropy as ce_iree
+from nlearn.model import init_model, model_forward_features, model_forward, D_MODEL, VOCAB_SIZE
+import nlearn.kernels.gemm as gemm_iree
 SEQ = int(os.environ.get("RX_SEQ", "8192"))
 
 params = jax.jit(init_model)(jax.random.PRNGKey(0))

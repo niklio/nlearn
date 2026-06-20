@@ -1,102 +1,97 @@
 # Repository layout & organizing principles
 
 A map of where things live and the rules that keep it navigable. Read this before
-adding a file or moving one — a few hard constraints (below) will bite if ignored.
+adding or moving a file.
 
 ## Layout
 
 ```
-nlearn/
-├── README.md, CLAUDE.md, STRUCTURE.md   # docs: project narrative, agent notes, this file
-├── requirements*.txt                    # deps (.txt = cuda / jaxmetal / base)
+nlearn/                          # repo root
+├── nlearn/                      # ── the core library (a Python package) ──
+│   ├── __init__.py
+│   ├── model.py                 # the GPT-style transformer (layers, RoPE, forward, init)
+│   ├── attention.py             # cross-platform attention dispatch (Metal flash binding)
+│   ├── train.py                 # training loop        →  python -m nlearn.train
+│   ├── generate.py              # sampling/generation   →  python -m nlearn.generate
+│   ├── logging_utils.py         # step timing, MFU, validation, leaderboard posting
+│   ├── leaderboard.py           # multi-tenant leaderboard HTTP client
+│   ├── kernels/                 # IREE-Metal kernel bindings (python side of iree_metal/kernels/)
+│   │   ├── gemm.py              #   custom simdgroup GEMM (custom_vjp)
+│   │   └── cross_entropy.py     #   fused softmax cross-entropy (loss + dlogits)
+│   └── data/
+│       ├── streaming.py         # streaming corpus loader + BPE training pipeline
+│       └── tokenizer.py         # BPE tokenizer (train / encode / load)
 │
-│   ── core library (flat at root on purpose — see Principle 1) ──
-├── model.py            # the GPT-style transformer (layers, RoPE, forward, init)
-├── attention.py        # cross-platform attention dispatch (Metal flash kernel binding)
-├── gemm_iree.py        # custom Metal simdgroup GEMM binding (custom_vjp)
-├── ce_iree.py          # fused cross-entropy kernel binding
-├── logging_utils.py    # step timing, MFU, validation, leaderboard posting
-├── data.py             # corpus streaming + BPE training pipeline
-├── tokenizer.py        # BPE tokenizer (train/encode/load)
-├── leaderboard_client.py  # multi-tenant leaderboard HTTP client
-├── leaderboard.config.json  # board schema for project `nlearn`
+├── cluster.py                   # remote Mac-mini job orchestration (SSH + pueue) — ops entry point
+├── leaderboard.config.json      # board schema for project `nlearn`
+├── requirements*.txt            # deps (.txt = base / cuda / jaxmetal)
+├── README.md, CLAUDE.md, STRUCTURE.md
 │
-│   ── entry points (run as `python <file>.py …`) ──
-├── train.py            # training loop
-├── generate.py         # sampling/generation
-├── cluster.py          # remote Mac-mini job orchestration (SSH + pueue)
+├── iree_env.sh, .runenv.sh      # IREE-Metal env bootstrap (build host / this mini) — stay at root
 │
-│   ── environment bootstrap (stay at root — see Principle 4) ──
-├── iree_env.sh         # IREE-Metal env for the build host (uses ~/src/iree build)
-├── .runenv.sh          # IREE-Metal env for THIS mini (prebuilt .iree_runtime bundle)
+├── scripts/                     # operational shell scripts (run/supervise/monitor/cluster ops)
+├── bench/                       # kernel & perf benchmarks and probes
+├── tools/                       # one-off dev/data utilities
 │
-├── scripts/            # operational shell scripts (run/supervise/monitor/cluster ops)
-├── bench/              # kernel & perf benchmarks and probes
-├── tools/              # one-off dev/data utilities
+├── iree_metal/                  # the Metal kernels + IREE compiler patches + PJRT plugin (self-contained)
+├── leaderboard/                 # leaderboard agent-notes + git hooks (pre-commit kernel bench)
 │
-├── iree_metal/         # the Metal kernels + IREE compiler patches + PJRT plugin (self-contained, documented)
-├── leaderboard/        # leaderboard agent-notes + git hooks (pre-commit kernel bench)
-│
-└── (gitignored runtime artifacts) logs/  wandb/  checkpoints/  datasets/  tokenizer.json  __pycache__/
+└── (gitignored runtime artifacts) logs/  wandb/  checkpoints/  datasets/  tokenizer.json  .iree_runtime/  __pycache__/
 ```
 
 ## Principles (the rules that keep this clean)
 
-1. **Core library modules live flat at the repo root.** They import each other by
-   bare name (`from model import …`, `from gemm_iree import linear`). Python only
-   resolves bare imports against the script's own dir / `sys.path`, so burying them
-   in a package breaks every import unless you also rewire it. If you add a module
-   that `train.py`/`model.py` import, it goes at root.
+1. **The core library is the `nlearn/` package.** Import from it explicitly:
+   `from nlearn.model import …`, `from nlearn.kernels.gemm import linear`,
+   `from nlearn.data.tokenizer import …`. New library code goes inside `nlearn/`
+   (pick the right subpackage: `kernels/` for Metal-kernel bindings, `data/` for the
+   data pipeline, top level for model/training/infra).
 
-2. **A subdir script that imports a root module must add the root to `sys.path`.**
-   Files in `bench/` (and anywhere below root) that do `import model` / `import
-   leaderboard_client` carry this bootstrap as their first executable line:
+2. **Entry points run as modules:** `python -m nlearn.train …`, `python -m nlearn.generate …`.
+   `cluster.py` builds these commands; the supervisors in `scripts/` call them. There
+   are no `python train.py` scripts at root anymore.
+
+3. **`import nlearn` resolves because the repo root is on `PYTHONPATH`.** `.runenv.sh`
+   sets it; `python -m …` run from the repo root adds it automatically. Scripts in
+   subdirs that import the package (e.g. `bench/`) carry a one-line bootstrap as their
+   first executable line:
    ```python
    import os, sys; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
    ```
-   Without it, `python bench/foo.py` puts `bench/` (not root) on the path and the
-   import fails.
 
-3. **Operational shell scripts go in `scripts/` and resolve the repo root themselves.**
-   Never assume the current directory. Use `cd "$(dirname "$0")/.."` (scripts that
-   write `logs/…`, read `.cluster.conf`, etc. depend on cwd being root). Supervisors
-   that `cd` to an absolute path are fine as-is.
+4. **Operational shell scripts go in `scripts/` and resolve the repo root themselves.**
+   Never assume the current directory — use `cd "$(dirname "$0")/.."`.
 
-4. **`iree_env.sh` and `.runenv.sh` stay at root.** ~12 kernel test scripts under
+5. **`iree_env.sh` and `.runenv.sh` stay at root.** Kernel test scripts under
    `iree_metal/kernels/test/` and the leaderboard pre-commit hook `source` them by a
-   root-relative path. Moving them breaks all of those silently.
+   root-relative path.
 
-5. **Categorize new non-core files by role:** a benchmark/perf probe → `bench/`; a
-   one-off data or dev utility → `tools/`; an ops/run script → `scripts/`; Metal
-   kernel or compiler work → `iree_metal/`. Keep root to the library + entry points
-   + env bootstrap.
+6. **Categorize new non-library files by role:** a benchmark/perf probe → `bench/`; a
+   one-off data or dev utility → `tools/`; an ops/run script → `scripts/`; Metal kernel
+   or compiler work → `iree_metal/`.
 
-6. **Runtime artifacts are gitignored and written at root-relative paths.** `logs/`,
-   `wandb/`, `checkpoints/<run>/`, `datasets/`, `tokenizer.json`. Never commit them;
-   don't relocate them (code writes/reads these exact paths).
+7. **Runtime artifacts are gitignored and written at root-relative paths.** `logs/`,
+   `wandb/`, `checkpoints/<run>/`, `datasets/`, `tokenizer.json`, `.iree_runtime/`.
+   Never commit them; don't relocate them.
 
-7. **The kernel pre-commit hook greps staged paths.** `leaderboard/hooks/pre-commit`
-   triggers a kernel benchmark when `attention.py`, `gemm_iree.py`, `ce_iree.py`, or
-   `iree_metal/kernels/*` change — it expects those at root. If you move a kernel
-   binding, update the hook's path patterns and its `$ROOT/bench/bench_kernels.py` call.
+8. **The kernel pre-commit hook greps staged paths.** `leaderboard/hooks/pre-commit`
+   triggers a kernel benchmark when `nlearn/attention.py`, `nlearn/kernels/gemm.py`,
+   `nlearn/kernels/cross_entropy.py`, or `iree_metal/kernels/*` change. If you move a
+   kernel binding, update the hook's path patterns and its `bench/bench_kernels.py` call.
 
 ## "Where does my new file go?" — quick guide
 
 | It is… | Put it in… |
 |---|---|
-| imported by `train.py`/`model.py` | repo root (Principle 1) |
-| a `python X.py` you run directly | repo root (entry point) |
-| a benchmark / perf probe | `bench/` (+ Principle 2 if it imports root) |
-| a data prep / dev helper | `tools/` (+ Principle 2 if it imports root) |
-| a run/supervise/monitor shell script | `scripts/` (+ Principle 3) |
+| model / training / kernel-binding / data library code | inside `nlearn/` (right subpackage) |
+| a new runnable command | `nlearn/<name>.py` with a `main()`, run via `python -m nlearn.<name>` |
+| a benchmark / perf probe | `bench/` (+ the `sys.path` bootstrap) |
+| a data prep / dev helper | `tools/` (+ bootstrap if it imports `nlearn`) |
+| a run/supervise/monitor shell script | `scripts/` (resolve root via `dirname/..`) |
 | a Metal kernel, compiler patch, plugin code | `iree_metal/` |
 | a produced log/checkpoint/dataset | leave it gitignored; don't commit |
 
 ## Single working tree
 
 `~/nlearn` is the one and only working tree **and** git repo (remote
-`github.com/niklio/nlearn`, branch `main`). Do all work here. The former
-`~/nlearn-git` clone has been reconciled in and deleted — there is no second copy
-to keep in sync. (History note: `ce_iree.py`, `data.py`, `tokenizer.py`, and
-`iree_metal/kernels/cross_entropy.metal` were untracked before the reconciliation;
-they are committed now.)
+`github.com/niklio/nlearn`, branch `main`). There is no second clone to keep in sync.

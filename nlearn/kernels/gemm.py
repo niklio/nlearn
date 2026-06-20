@@ -1,4 +1,4 @@
-"""gemm_iree.py — route matmuls through the custom Metal simdgroup GEMM kernel.
+"""nlearn.kernels.gemm — route matmuls through the custom Metal simdgroup GEMM kernel.
 
 On the IREE-Metal backend, `gemm(A, B)` dispatches the hand-authored
 `kernels/gemm.metal` (f16 in, f32 accumulate, ~2.4 TFLOPS vs IREE's naive

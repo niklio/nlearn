@@ -1,7 +1,7 @@
 import sys, jax, jax.numpy as jnp, optax
 from jax import random
 import os, sys; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root on sys.path (this file lives in bench/)
-import train as T
+import nlearn.train as T
 
 bs = int(sys.argv[1])
 key = random.PRNGKey(0)

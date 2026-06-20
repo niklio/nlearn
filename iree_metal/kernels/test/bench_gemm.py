@@ -4,7 +4,7 @@ dominate a training step. Source iree_env.sh first. Times wall-clock per call
 import os, sys, time
 import jax, jax.numpy as jnp
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
-from gemm_iree import gemm
+from nlearn.kernels.gemm import gemm
 
 # (M, K, N, label) — the lm_head fwd/bwd and a square baseline.
 SHAPES = [

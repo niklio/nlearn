@@ -1,4 +1,4 @@
-"""ce_iree.py — fused softmax cross-entropy via the custom Metal kernels.
+"""nlearn.kernels.cross_entropy — fused softmax cross-entropy via the custom Metal kernels.
 
 `cross_entropy(logits, targets)` computes mean softmax CE and its gradient through
 the hand-authored `cross_entropy.metal` (ce_fwd: per-row logsumexp + loss; ce_bwd:
@@ -98,7 +98,7 @@ def _lce_chunks(V):
 
 def _lce_mm():
     if USE_IREE_CE:
-        import gemm_iree
+        import nlearn.kernels.gemm as gemm_iree
         return gemm_iree.matmul
     return jnp.matmul
 

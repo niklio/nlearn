@@ -1,5 +1,5 @@
 """
-data.py — Stream and prepare a HuggingFace dataset for training.
+nlearn.data.streaming — Stream and prepare a HuggingFace dataset for training.
 
 Streams a dataset from HuggingFace, (optionally) retrains the BPE tokenizer
 on a sample, then tokenizes the corpus and writes it to a binary file that
@@ -25,7 +25,7 @@ import os
 import numpy as np
 from datasets import load_dataset
 
-from tokenizer import train as train_bpe, encode as bpe_encode, load_tokenizer
+from nlearn.data.tokenizer import train as train_bpe, encode as bpe_encode, load_tokenizer
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION

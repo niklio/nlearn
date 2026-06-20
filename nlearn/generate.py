@@ -25,7 +25,7 @@ import wandb
 
 import tiktoken
 
-from model import generate as model_generate
+from nlearn.model import generate as model_generate
 
 
 def download_checkpoint(run_id, project, entity):

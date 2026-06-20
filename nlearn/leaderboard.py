@@ -1,5 +1,5 @@
 """
-leaderboard_client.py — push to a multi-tenant leaderboard.
+nlearn.leaderboard — push to a multi-tenant leaderboard.
 
 Non-disruptive by design: posting runs on a background daemon thread with a short
 timeout and never raises, so it can't block or crash a training loop. If the env
@@ -12,7 +12,7 @@ Config (env):
   LEADERBOARD_ADMIN_TOKEN  admin token (only for `projects create`)
 
 Library:
-    from leaderboard_client import post_entry, register_config
+    from nlearn.leaderboard import post_entry, register_config
     register_config({"title": "...", "boards": [...]})        # once, on deploy
     post_entry("pretraining", {"id": "run-1", "metrics": {...}})
 

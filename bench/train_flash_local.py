@@ -20,8 +20,8 @@ from jax import random
 import optax
 import tiktoken
 
-from model import init_model, model_forward, VOCAB_SIZE
-import attention as A
+from nlearn.model import init_model, model_forward, VOCAB_SIZE
+import nlearn.attention as A
 
 
 # Simple full-vocab cross-entropy. NOTE: train.py's memory-efficient 13-chunk

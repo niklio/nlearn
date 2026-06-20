@@ -24,9 +24,9 @@ PY="${PYTHON:-}"
 changed="$(git diff --cached --name-only || true)"
 
 want_flash=0; want_gemm=0; want_ce=0
-echo "$changed" | grep -qE '^(attention\.py|iree_metal/kernels/flash)'        && want_flash=1
-echo "$changed" | grep -qE '^(gemm_iree\.py|iree_metal/kernels/gemm)'         && want_gemm=1
-echo "$changed" | grep -qE '^(ce_iree\.py|iree_metal/kernels/cross_entropy)'  && want_ce=1
+echo "$changed" | grep -qE '^(nlearn/attention\.py|iree_metal/kernels/flash)'              && want_flash=1
+echo "$changed" | grep -qE '^(nlearn/kernels/gemm\.py|iree_metal/kernels/gemm)'            && want_gemm=1
+echo "$changed" | grep -qE '^(nlearn/kernels/cross_entropy\.py|iree_metal/kernels/cross_entropy)' && want_ce=1
 
 [ "$want_flash" -eq 0 ] && [ "$want_gemm" -eq 0 ] && [ "$want_ce" -eq 0 ] && exit 0
 

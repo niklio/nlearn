@@ -1,7 +1,7 @@
 #!/bin/bash
 # Supervisor for the seq=4096 converged run on THIS Mac mini (user agentjohnson).
 # Adapted from supervise_run.sh: survives the recurring Metal-HAL GPU hang by
-# relaunching train.py --resume from the last checkpoint until "Training complete".
+# relaunching -m nlearn.train --resume from the last checkpoint until "Training complete".
 # Uses .runenv.sh (the prebuilt .iree_runtime bundle) instead of iree_env.sh.
 #
 # Usage: ./supervise_s4096.sh <run_name> <steps_microbatches> [peak_lr]
@@ -27,7 +27,7 @@ for attempt in $(seq 1 $MAX_RESTARTS); do
   pkill -9 -f "run-name $RUN" 2>/dev/null; sleep 3
   until gpu_ok; do echo "[superv] GPU not ready, waiting..." | tee -a "$LOG"; sleep 15; done
   echo "[superv $(date +%T)] attempt $attempt" | tee -a "$LOG"
-  "$VENV_PY" -u train.py --steps "$STEPS" --batch-size 2 --seq-len 4096 \
+  "$VENV_PY" -u -m nlearn.train --steps "$STEPS" --batch-size 2 --seq-len 4096 \
       --peak-lr "$PEAK_LR" --run-name "$RUN" --resume >>"$LOG" 2>&1 &
   PID=$!
   last_n=-1; stall=0; started=0

@@ -29,9 +29,11 @@ import os, sys; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspa
 import resource
 import time
 
-from leaderboard_client import is_enabled, post_entry
+from nlearn.leaderboard import is_enabled, post_entry
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)         # repo root (bench/ is one level down)
+PKG  = os.path.join(ROOT, "nlearn")  # the nlearn package
 
 
 def _hash_files(paths):
@@ -74,7 +76,7 @@ def bench_flash(heads, seq, dhead, dtype_name, warmup, trials):
     import jax
     import jax.numpy as jnp
     import numpy as np
-    import attention as attn_mod
+    import nlearn.attention as attn_mod
 
     dtype = getattr(jnp, dtype_name)
     rng = np.random.default_rng(0)
@@ -118,8 +120,8 @@ def bench_flash(heads, seq, dhead, dtype_name, warmup, trials):
 
     impl_name = _active_attention_impl(attn_mod)
     src_hash = _hash_files([
-        os.path.join(HERE, "attention.py"),
-        os.path.join(HERE, "iree_metal", "kernels", "flash_attention.metal"),
+        os.path.join(PKG, "attention.py"),
+        os.path.join(ROOT, "iree_metal", "kernels", "flash_attention.metal"),
     ])
     entry = {
         "id": f"flash-{impl_name}-{src_hash}",
@@ -175,7 +177,7 @@ def bench_gemm(m, n, k, dtype_name, warmup, trials):
     # % of hardware peak (best-effort; same matmul-based probe train.py uses).
     pct_peak = None
     try:
-        from logging_utils import benchmark_peak_tflops
+        from nlearn.logging_utils import benchmark_peak_tflops
         peak = benchmark_peak_tflops(dtype=dtype)
         if peak > 0:
             pct_peak = tflops / peak
@@ -211,7 +213,7 @@ def _active_gemm():
     elsewhere. So this measures whatever the agent is currently optimizing."""
     import jax.numpy as jnp
     try:
-        import gemm_iree
+        import nlearn.kernels.gemm as gemm_iree
         return gemm_iree.matmul
     except Exception:
         return jnp.matmul
@@ -219,18 +221,18 @@ def _active_gemm():
 
 def _gemm_impl_label():
     try:
-        import gemm_iree
+        import nlearn.kernels.gemm as gemm_iree
         return "gemm_iree" if getattr(gemm_iree, "USE_IREE_GEMM", False) else "jnp-fallback"
     except Exception:
         return "jnp"
 
 
 def _gemm_identity():
-    src = os.path.join(HERE, "gemm_iree.py")
-    kernel = os.path.join(HERE, "iree_metal", "kernels", "gemm.metal")
+    src = os.path.join(PKG, "kernels", "gemm.py")
+    kernel = os.path.join(ROOT, "iree_metal", "kernels", "gemm.metal")
     if os.path.exists(src):
         return _gemm_impl_label(), _hash_files([src, kernel])
-    return "jnp", _hash_files([os.path.join(HERE, "model.py")])
+    return "jnp", _hash_files([os.path.join(PKG, "model.py")])
 
 
 # ---------------------------------------------------------------------------
@@ -253,16 +255,16 @@ def _active_ce():
     """The CE under test: ce_iree.cross_entropy (the fused kernel) once it exists,
     else the one-hot baseline — so this measures whatever the agent is optimizing."""
     try:
-        import ce_iree
+        import nlearn.kernels.cross_entropy as ce_iree
         return ce_iree.cross_entropy, "ce_iree"
     except Exception:
         return _onehot_ce, "onehot-baseline"
 
 
 def _ce_identity(impl_name):
-    src = os.path.join(HERE, "ce_iree.py")
-    kernel = os.path.join(HERE, "iree_metal", "kernels", "cross_entropy.metal")
-    files = [f for f in (src, kernel) if os.path.exists(f)] or [os.path.join(HERE, "train.py")]
+    src = os.path.join(PKG, "kernels", "cross_entropy.py")
+    kernel = os.path.join(ROOT, "iree_metal", "kernels", "cross_entropy.metal")
+    files = [f for f in (src, kernel) if os.path.exists(f)] or [os.path.join(PKG, "train.py")]
     return _hash_files(files)
 
 
@@ -317,7 +319,8 @@ def bench_lce(m, d, v, dtype_name, warmup, trials):
     """Fused linear-CE (lm_head matmul + CE, chunked over vocab) — never materialises
     the (M,V) logits. Headline is peak memory (the long-context enabler) + latency.
     Posts to the same Cross-Entropy board with a distinct id."""
-    import jax, jax.numpy as jnp, numpy as np, ce_iree
+    import jax, jax.numpy as jnp, numpy as np
+    import nlearn.kernels.cross_entropy as ce_iree
     dtype = getattr(jnp, dtype_name)
     rng = np.random.default_rng(0)
     X = jnp.asarray((rng.standard_normal((m, d)) * 0.1).astype(np.float32)).astype(dtype)

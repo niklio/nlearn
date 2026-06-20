@@ -1,6 +1,6 @@
 #!/bin/bash
 # Supervisor: run a training run to completion, surviving the recurring Metal-HAL GPU
-# hang (~every 100 batched steps). Launches train.py --resume; if the process freezes
+# hang (~every 100 batched steps). Launches -m nlearn.train --resume; if the process freezes
 # (CPU time stops advancing), kills it, lets the GPU recover, and relaunches — which
 # resumes from the last checkpoint. Repeats until "Training complete" or MAX_RESTARTS.
 #
@@ -23,7 +23,7 @@ for attempt in $(seq 1 $MAX_RESTARTS); do
   pkill -9 -f "run-name $RUN" 2>/dev/null; sleep 3
   until gpu_ok; do echo "[superv] GPU not ready, waiting..." | tee -a "$LOG"; sleep 15; done
   echo "[superv $(date +%T)] attempt $attempt" | tee -a "$LOG"
-  ~/.venvs/iree/bin/python train.py --steps "$STEPS" --batch-size 16 --seq-len 512 \
+  ~/.venvs/iree/bin/python -m nlearn.train --steps "$STEPS" --batch-size 16 --seq-len 512 \
       --peak-lr "$PEAK_LR" --run-name "$RUN" --resume >>"$LOG" 2>&1 &
   PID=$!
   # Detect hang by TRAINING-STEP PROGRESS, not CPU time: train.py's background data
