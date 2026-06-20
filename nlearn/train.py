@@ -15,7 +15,7 @@ from datasets import load_dataset
 
 import tiktoken
 
-from nlearn.model import init_model, model_forward, model_forward_features, generate, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
+from nlearn.model import init_model, model_forward, model_forward_features, generate, output_projection, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
 from nlearn.attention import print_attention_config
 from nlearn.logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
 from nlearn.kernels.cross_entropy import cross_entropy as _fused_ce
@@ -158,7 +158,7 @@ def cross_entropy_loss(params, token_ids):
 
     # Pad lm_head with zeros (NOT -inf — that causes NaN in the matmul when
     # x has mixed signs). We suppress padded positions via _VOCAB_MASK after.
-    W = params['lm_head']  # (D_MODEL, VOCAB_SIZE)
+    W = output_projection(params)  # (D_MODEL, VOCAB_SIZE), tied to the token embedding
     if _PAD > 0:
         W = jnp.concatenate([W, jnp.zeros((D_MODEL, _PAD))], axis=1)
 
@@ -279,7 +279,7 @@ def _simple_ce_batched(params, batch):
     if _FUSED_LMHEAD:
         # Fuse lm_head + CE, chunked over vocab — never materialise (bs·seq, vocab).
         x = model_forward_features(params, input_ids)       # (bs, seq, D_MODEL)
-        return _fused_linear_ce(x.reshape(-1, D_MODEL), params['lm_head'],
+        return _fused_linear_ce(x.reshape(-1, D_MODEL), output_projection(params),
                                 target_ids.reshape(-1))
     logits = model_forward(params, input_ids)               # (bs, seq, VOCAB_SIZE)
     return _fused_ce(logits, target_ids)

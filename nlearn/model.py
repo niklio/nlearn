@@ -15,13 +15,20 @@ from nlearn.kernels.gemm import linear                 # batched x[...,K]@W[K,N]
 # ---------------------------------------------------------------------------
 
 VOCAB_SIZE  = 50257    # GPT-2 vocabulary size (tiktoken "gpt2" encoding).
-D_MODEL     = 512      # "Dimension of the model" — every token is represented as a vector of this length.
-                       # Increased from 128 → 512. Parameters scale as D_MODEL², so this is ~16M params vs 873k.
-N_HEADS     = 8        # Number of attention heads. D_MODEL must be divisible by N_HEADS (512 / 8 = 64 per head).
-                       # Increased from 4 → 8 to match the larger D_MODEL.
-D_FF        = 2048     # Hidden size of the feed-forward sublayer. Kept at 4 * D_MODEL (4 * 512 = 2048).
-N_LAYERS    = 4        # How many transformer blocks to stack. GPT-3 has 96.
+D_MODEL     = 768      # "Dimension of the model" — every token is a vector of this length.
+                       # Scaled 512 → 768 (params ∝ D_MODEL²) toward the ~123M target for loss ~3.2.
+N_HEADS     = 12       # Attention heads. D_MODEL must be divisible by N_HEADS (768 / 12 = 64 per head,
+                       # matching the flash kernel's d_head). dh stays 64 across the scale-up.
+D_FF        = 2048     # SwiGLU hidden size. ~(8/3)·D_MODEL is the param-matched point
+                       # vs a 4× GeLU MLP; 2048 ≈ (8/3)·768 for the scaled config.
+N_LAYERS    = 12       # Transformer blocks. Scaled 4 → 12: depth is the cheapest real capacity
+                       # (the old 4-layer stack was the model's most undersized axis).
 MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
+
+# Depth-scaled init: residual-output projections (attention W_o, FFN W_down) are
+# scaled by 1/sqrt(2·N_LAYERS) so the residual stream variance stays ~constant with
+# depth — lets deep stacks train stably (GPT-2/Llama-style).
+RESIDUAL_SCALE = (2 * N_LAYERS) ** -0.5
 
 # Forward-pass dtype (stored params stay float32). fp16 on Metal because IREE's
 # metal-spirv target for Apple GPUs advertises fp16 but NOT bf16 (bf16 matmuls
@@ -120,10 +127,17 @@ def init_attention(key):
         # W_v projects input into "value space".
         # Value = "what do I actually send if someone attends to me?"
 
-        'W_o': random.normal(key_o, (D_MODEL, D_MODEL)) * scale,
+        'W_o': random.normal(key_o, (D_MODEL, D_MODEL)) * (scale * RESIDUAL_SCALE),
         # W_o is the output projection applied after all heads are concatenated.
         # It mixes information across heads and projects back to D_MODEL dims.
+        # Residual-output projection → depth-scaled init (×1/sqrt(2·N_LAYERS)).
     }
+
+
+def _qk_norm(x, eps=1e-6):
+    """Parameterless RMSNorm over the head dim (last axis) — used for QK-norm on
+    Q and K. x: (bs·heads, seq, d_head). Returns same shape, unit-RMS per head vector."""
+    return x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
 
 
 def apply_rope(x, positions, base=10000.0):
@@ -167,6 +181,12 @@ def attention_forward(params, x):
 
     Q, K, V = proj(params['W_q']), proj(params['W_k']), proj(params['W_v'])
 
+    # QK-norm: RMS-normalize Q and K over the head dim (parameterless) before RoPE.
+    # Bounds ||q||,||k|| so attention logits can't blow up — stabilizes deep training
+    # and tolerates a higher learning rate. (V is untouched.)
+    Q = _qk_norm(Q)
+    K = _qk_norm(K)
+
     # RoPE: rotate Q and K by position (no learned table; extrapolates to any seq_len).
     positions = jnp.arange(seq_len)
     Q = apply_rope(Q, positions)
@@ -195,49 +215,30 @@ def attention_forward(params, x):
 
 def init_layer_norm():
     """
-    Layer norm has two learnable parameters per feature dimension:
+    RMSNorm has ONE learnable parameter per feature dimension:
       gamma (scale) — initialized to 1, learned multiplier
-      beta  (shift) — initialized to 0, learned offset
-    No randomness needed here — these are deterministic starting points.
+    (No mean-centering and no beta shift — RMSNorm drops both vs LayerNorm; it's
+    cheaper, fewer params, and trains as well or better at depth — Llama/T5 style.)
     """
     return {
         'gamma': jnp.ones(D_MODEL),   # Shape: (D_MODEL,). Ones = no scaling at init.
-        'beta':  jnp.zeros(D_MODEL),  # Shape: (D_MODEL,). Zeros = no shift at init.
     }
 
 
 def layer_norm(params, x):
     """
-    Normalizes each token's vector to have mean=0 and std=1,
-    then applies a learned scale (gamma) and shift (beta).
+    RMSNorm: scales each token's vector to unit root-mean-square (no mean-centering),
+    then applies a learned per-feature scale (gamma).
 
-    x: shape (seq_len, D_MODEL)
-    Returns same shape.
+        x_norm = x / sqrt(mean(x^2) + eps);   return gamma * x_norm
+
+    x: shape (..., D_MODEL)   Returns same shape.
+    (Kept the name `layer_norm` so call sites are unchanged.)
     """
     eps = 1e-5
-    # A tiny constant added to the denominator to prevent division by zero
-    # in the rare case where variance is exactly 0.
-
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    # Compute the mean across the D_MODEL dimension for each token independently.
-    # axis=-1 = last axis = the feature dimension.
-    # keepdims=True keeps the shape as (seq_len, 1) instead of (seq_len,)
-    # so that broadcasting works correctly in the subtraction below.
-
-    var = jnp.var(x, axis=-1, keepdims=True)
-    # Compute the variance across D_MODEL for each token.
-    # Shape: (seq_len, 1)
-
-    x_norm = (x - mean) / jnp.sqrt(var + eps)
-    # Subtract mean and divide by standard deviation.
-    # Now each token vector has mean=0 and std=1 across its D_MODEL features.
-    # Shape: (seq_len, D_MODEL)
-
-    return params['gamma'] * x_norm + params['beta']
-    # Apply learned scale and shift.
-    # gamma and beta are shape (D_MODEL,) — they broadcast across the seq_len dimension.
-    # At init this is a no-op (1 * x_norm + 0), but during training
-    # the model learns the right scale and shift for each feature.
+    ms = jnp.mean(x * x, axis=-1, keepdims=True)         # mean square over features
+    x_norm = x * jax.lax.rsqrt(ms + eps)                  # unit-RMS, no centering
+    return params['gamma'] * x_norm
 
 
 def init_ffn(key):
@@ -250,47 +251,30 @@ def init_ffn(key):
     The expansion to D_FF (4× wider) gives the model capacity to compute
     complex non-linear transformations on each token's representation.
     """
-    key1, key2 = random.split(key)  # Two keys for two weight matrices.
+    key_g, key_u, key_d = random.split(key, 3)  # gate / up / down
 
     return {
-        'W1': random.normal(key1, (D_MODEL, D_FF)) * 0.02,
-        # First linear layer expands from D_MODEL to D_FF.
-        # Shape: (128, 512)
-
-        'b1': jnp.zeros(D_FF),
-        # Bias for the first layer. Shape: (512,). Initialized to zero.
-
-        'W2': random.normal(key2, (D_FF, D_MODEL)) * 0.02,
-        # Second linear layer compresses back from D_FF to D_MODEL.
-        # Shape: (512, 128)
-
-        'b2': jnp.zeros(D_MODEL),
-        # Bias for the second layer. Shape: (128,). Initialized to zero.
+        # SwiGLU: out = (silu(x·W_gate) ⊙ (x·W_up)) · W_down. Two parallel input
+        # projections (gate + up) and a down projection — no biases (SwiGLU drops them).
+        'W_gate': random.normal(key_g, (D_MODEL, D_FF)) * 0.02,
+        'W_up':   random.normal(key_u, (D_MODEL, D_FF)) * 0.02,
+        # W_down is a residual-output projection → depth-scaled init for stable deep training.
+        'W_down': random.normal(key_d, (D_FF, D_MODEL)) * (0.02 * RESIDUAL_SCALE),
     }
 
 
 def ffn_forward(params, x):
     """
-    Runs the feed-forward network on each token independently.
+    SwiGLU feed-forward, per token: gated GLU with a SiLU (swish) gate.
+        h = silu(x · W_gate) ⊙ (x · W_up)        # gate modulates the up-projection
+        return h · W_down
+    The gating consistently lowers loss vs a plain GeLU MLP (Llama/PaLM).
 
-    x: shape (seq_len, D_MODEL)
-    Returns same shape.
+    x: shape (..., D_MODEL)   Returns same shape.
     """
-    x = linear(x, params['W1']) + params['b1']
-    # Linear projection: (..., 512) @ (512, 2048) + (2048,) → (..., 2048)
-    # Each token is now represented in a 512-dimensional space.
-
-    x = jax.nn.gelu(x)
-    # GeLU (Gaussian Error Linear Unit) activation function.
-    # Similar to ReLU (zeros out negatives) but smooth — it doesn't have a hard cutoff at 0.
-    # Used by GPT-2, GPT-3, and most modern LLMs.
-    # Without a non-linearity here, two linear layers would collapse into one — no extra power.
-
-    x = linear(x, params['W2']) + params['b2']
-    # Project back down: (..., 2048) @ (2048, 512) + (512,) → (..., D_MODEL)
-    # Each token is back to its original D_MODEL size, but transformed.
-
-    return x  # Shape: (seq_len, D_MODEL)
+    gate = jax.nn.silu(linear(x, params['W_gate']))   # silu(x) = x·sigmoid(x)
+    up   = linear(x, params['W_up'])
+    return linear(gate * up, params['W_down'])
 
 
 # ---------------------------------------------------------------------------
@@ -349,33 +333,35 @@ def init_model(key):
     Initializes every parameter in the full decoder-only transformer.
     Returns a single nested dict containing all parameters.
     """
-    # Split into enough keys: 1 for embeddings, N_LAYERS for blocks, 1 for lm_head.
-    keys = random.split(key, N_LAYERS + 2)
+    # Split into enough keys: 1 for embeddings, N_LAYERS for blocks. (No lm_head key —
+    # the output projection is TIED to the token embedding, see output_projection().)
+    keys = random.split(key, N_LAYERS + 1)
 
     return {
         'embeddings': init_embeddings(keys[0]),
-        # Token + positional embedding tables. Shape: (VOCAB_SIZE, D_MODEL) and (MAX_SEQ_LEN, D_MODEL).
+        # Token embedding table, shape (VOCAB_SIZE, D_MODEL). Doubles as the output
+        # projection (tied weights) — no separate lm_head, saving VOCAB_SIZE·D_MODEL params
+        # (~25M at D_MODEL=512, the bulk of a small model).
 
         'blocks': [init_block(keys[i + 1]) for i in range(N_LAYERS)],
         # A Python list of N_LAYERS block parameter dicts.
         # Each block is independent with its own weights — they don't share parameters.
-        # List comprehension: for i in 0,1,2,3 → init_block(keys[1]), init_block(keys[2]), ...
 
         'ln_final': init_layer_norm(),
-        # One last layer norm applied after all blocks, before the output projection.
-        # GPT-2 introduced this — it stabilizes the final representations.
-
-        'lm_head': random.normal(keys[-1], (D_MODEL, VOCAB_SIZE)) * 0.02,
-        # "Language model head" — projects each token's D_MODEL vector to VOCAB_SIZE logits.
-        # Shape: (128, 256). One logit per vocabulary token.
-        # The logit with the highest value = the model's best guess for the next token.
+        # One last RMSNorm applied after all blocks, before the (tied) output projection.
     }
+
+
+def output_projection(params):
+    """The output (unembedding) matrix, TIED to the token embedding: (D_MODEL, VOCAB_SIZE).
+    `linear(x, output_projection(params))` gives the vocab logits."""
+    return params['embeddings']['token_embed'].T
 
 
 def model_forward_features(params, token_ids):
     """
     Forward pass through all transformer blocks, returning hidden states
-    before the final lm_head projection.
+    before the final (tied) output projection.
 
     token_ids: 1D integer array of shape (seq_len,)
     Returns:   2D float array of shape (seq_len, D_MODEL)
@@ -408,8 +394,8 @@ def model_forward(params, token_ids):
                logits[i] = scores for what token comes after position i
     """
     x = model_forward_features(params, token_ids)
-    # lm_head: (bs, seq, D_MODEL) @ (D_MODEL, VOCAB) as one flattened GEMM (M=bs·seq).
-    return linear(x, params['lm_head'])
+    # Tied output projection: (bs, seq, D_MODEL) @ (D_MODEL, VOCAB) as one flattened GEMM.
+    return linear(x, output_projection(params))
 
 
 # ---------------------------------------------------------------------------
