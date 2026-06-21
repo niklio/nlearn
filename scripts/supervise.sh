@@ -14,11 +14,15 @@ MAX_RESTARTS=100000          # effectively "until done" — it's a marathon
 STALL_LIMIT=120             # seconds of no step-progress => declare hang
 cd "$(dirname "$0")/.."     # repo root
 source .runenv.sh >/dev/null 2>&1
+# Leaderboard poster config (LEADERBOARD_URL/PROJECT/TOKEN). Normally auto-sourced
+# by ~/.zshrc, but the supervisor runs non-interactively (nohup/LaunchAgent) so
+# .zshrc never loads — source it here or live metrics never post.
+[ -f "$HOME/.config/nlearn/leaderboard.env" ] && source "$HOME/.config/nlearn/leaderboard.env" >/dev/null 2>&1
 export PYTHONUNBUFFERED=1
 export NLEARN_GRAD_ACCUM="$ACCUM"
 export NLEARN_CHECKPOINT_EVERY="${NLEARN_CHECKPOINT_EVERY:-50}"
 export HF_HUB_DOWNLOAD_TIMEOUT=60
-export WANDB_MODE=offline
+export WANDB_MODE="${WANDB_MODE:-online}"   # online so the run is visible live; override by exporting WANDB_MODE=offline
 
 gpu_ok() { "$VENV_PY" -c "import jax,jax.numpy as j;c=jax.jit(lambda a,b:a@b)(j.ones((8,8)),j.ones((8,8)));c.block_until_ready()" 2>/dev/null; }
 

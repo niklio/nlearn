@@ -11,7 +11,7 @@ import time
 import jax
 import wandb
 
-from nlearn.leaderboard import post_entry
+from nlearn.leaderboard import post_entry, post_series, get_series
 
 # Compute budget (in FLOPs) at which val loss is captured for ranking, so runs
 # of different lengths/speeds are compared at equal compute. Overridable via env.
@@ -129,6 +129,14 @@ class TrainingLogger:
         self._last_step_time = 0.0
         self._peak_mem_mb = 0.0
 
+        # --- Live timeseries (for the leaderboard run-view chart) ---
+        # One small point per logged step; decimated in place when it grows past
+        # 2*_SERIES_CAP so memory stays bounded over a multi-million-step marathon.
+        self._SERIES_CAP = 1200
+        # Seed from any series already stored for this run so resumes extend one
+        # continuous curve (each POST replaces the server copy). Best-effort.
+        self._series = get_series("pretraining", self._run_name)[: 2 * self._SERIES_CAP]
+
         # Tell W&B to also plot loss metrics against cumulative TFLOP (a count of
         # 10^12 ops, not the per-second rate) as x-axis.
         wandb.define_metric("loss/total_tflop")
@@ -241,8 +249,40 @@ class TrainingLogger:
                   f"step: {timer.step_time:.2f}s "
                   f"(data: {timer.data_time:.3f}s  train: {timer.train_time:.2f}s)")
 
+        # --- Live timeseries: append one point, push the series on val steps ---
+        # Keys match the board's declared columns (bare, not the wandb-namespaced
+        # form) so each metric de-dups against its scalar summary and renders as its
+        # own live chart in the run view. Throughput metrics are logged every step;
+        # val only on val steps. Skip tflops/mfu when unmeasured (avoids flat zeros).
+        point = {
+            "step": int(step),
+            "train": round(float(loss), 4),
+            "step_time": round(float(timer.step_time), 4),
+            "peak_mem_gb": round(mem_mb / 1024.0, 4),
+            "tokens": int((step + 1) * self._tokens_per_step),
+        }
+        if tflops:
+            point["tflops"] = round(float(tflops), 3)
+        if mfu:
+            point["mfu"] = round(float(mfu), 4)
+        if do_val and val_loss == val_loss:   # include val when finite
+            point["val"] = round(float(val_loss), 4)
+        self._append_series(point)
+        if do_val:
+            post_series("pretraining", self._run_name, self._series)
+
         wandb.log(metrics)
         return metrics
+
+    def _append_series(self, point):
+        """Append a point; decimate in place once it grows past 2× the cap so a
+        multi-million-step run keeps a bounded, evenly-thinned curve in memory."""
+        self._series.append(point)
+        if len(self._series) > 2 * self._SERIES_CAP:
+            kept = self._series[::2]
+            if kept[-1] is not self._series[-1]:
+                kept.append(self._series[-1])
+            self._series = kept
 
     def print_summary(self, loss):
         """Print final training summary."""

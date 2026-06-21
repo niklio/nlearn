@@ -77,6 +77,42 @@ def post_entry(board, entry, blocking=False, timeout=6.0):
     return True
 
 
+def post_series(board, run_id, points, timeout=6.0):
+    """Replace the live timeseries for one run (fire-and-forget).
+
+    `points` is a list of small dicts, e.g. {"step": 1400, "train": 5.1, "val": 5.25}.
+    The Worker stores the whole array (and downsamples past its cap), so the caller
+    should pass an already-decimated series. Never raises — like post_entry."""
+    if not is_enabled():
+        return False
+    _, project, token = _cfg()
+
+    def _go():
+        try:
+            _request("POST", f"/api/{project}/{board}/{run_id}/series",
+                     {"points": points}, token=token, timeout=timeout)
+        except Exception:
+            pass  # never surface leaderboard problems into the caller
+    threading.Thread(target=_go, daemon=True).start()
+    return True
+
+
+def get_series(board, run_id, timeout=6.0):
+    """Fetch a run's stored timeseries points (blocking; returns [] on any problem).
+
+    Used to seed an in-memory series on resume so a multi-segment run keeps one
+    continuous curve instead of overwriting history with each restart."""
+    if not is_enabled():
+        return []
+    _, project, _ = _cfg()
+    try:
+        r = _request("GET", f"/api/{project}/{board}/{run_id}/series", timeout=timeout)
+        pts = r.get("points") if isinstance(r, dict) else None
+        return pts if isinstance(pts, list) else []
+    except Exception:
+        return []
+
+
 def register_config(config, timeout=10.0):
     """Register/update this project's board schema (PUT /config). Blocking."""
     if not is_enabled():

@@ -15,7 +15,7 @@ from datasets import load_dataset
 
 import tiktoken
 
-from nlearn.model import init_model, model_forward, model_forward_features, generate, output_projection, VOCAB_SIZE, D_MODEL, COMPUTE_DTYPE
+from nlearn.model import init_model, model_forward, model_forward_features, generate, output_projection, VOCAB_SIZE, D_MODEL, N_HEADS, N_LAYERS, D_FF, COMPUTE_DTYPE
 from nlearn.attention import print_attention_config
 from nlearn.logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
 from nlearn.kernels.cross_entropy import cross_entropy as _fused_ce
@@ -523,10 +523,10 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
             "batch_size":   batch_size,
             "peak_lr":      peak_lr,
             "end_lr":       peak_lr / 10,
-            "d_model":      512,
-            "n_heads":      8,
-            "n_layers":     4,
-            "d_ff":         2048,
+            "d_model":      D_MODEL,
+            "n_heads":      N_HEADS,
+            "n_layers":     N_LAYERS,
+            "d_ff":         D_FF,
             "vocab_size":   VOCAB_SIZE,
             "dataset":      dataset,
             "tokenizer":    "tiktoken-gpt2",

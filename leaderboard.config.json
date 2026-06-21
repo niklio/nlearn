@@ -5,7 +5,8 @@
     {
       "id": "pretraining",
       "label": "Pretraining",
-      "blurb": "Full model training runs — ranked by validation loss at a fixed compute (FLOP) budget. Lower is better.",
+      "view": "runs",
+      "blurb": "Full model training runs — live, wandb-style. Open a run for its metric charts; sort any column (e.g. loss @ budget) to rank.",
       "rank": { "key": "loss_at_budget", "dir": "asc", "fallback": "val_loss" },
       "columns": [
         { "key": "loss_at_budget", "label": "Loss @ budget", "format": { "type": "number", "decimals": 3 }, "primary": true, "dir": "asc" },
