@@ -10,8 +10,6 @@
       "rank": { "key": "loss_at_budget", "dir": "asc", "fallback": "val_loss" },
       "columns": [
         { "key": "loss_at_budget", "label": "Loss @ budget", "format": { "type": "number", "decimals": 3 }, "primary": true, "dir": "asc" },
-        { "key": "val_loss", "label": "Best val loss", "format": { "type": "number", "decimals": 3 }, "dir": "asc" },
-        { "key": "train_loss", "label": "Train loss", "format": { "type": "number", "decimals": 3 }, "dir": "asc" },
         { "key": "tflops", "label": "TFLOP/s", "format": { "type": "number", "decimals": 2 }, "dir": "desc" },
         { "key": "mfu", "label": "MFU", "format": { "type": "percent" }, "dir": "desc" },
         { "key": "tokens", "label": "Tokens", "format": { "type": "compact" }, "dir": "desc" },
