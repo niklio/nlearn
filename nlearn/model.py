@@ -15,15 +15,16 @@ from nlearn.kernels.gemm import linear                 # batched x[...,K]@W[K,N]
 # ---------------------------------------------------------------------------
 
 VOCAB_SIZE  = 50257    # GPT-2 vocabulary size (tiktoken "gpt2" encoding).
-D_MODEL     = 768      # "Dimension of the model" — every token is a vector of this length.
-                       # Scaled 512 → 768 (params ∝ D_MODEL²) toward the ~123M target for loss ~3.2.
-N_HEADS     = 12       # Attention heads. D_MODEL must be divisible by N_HEADS (768 / 12 = 64 per head,
-                       # matching the flash kernel's d_head). dh stays 64 across the scale-up.
-D_FF        = 2048     # SwiGLU hidden size. ~(8/3)·D_MODEL is the param-matched point
-                       # vs a 4× GeLU MLP; 2048 ≈ (8/3)·768 for the scaled config.
-N_LAYERS    = 12       # Transformer blocks. Scaled 4 → 12: depth is the cheapest real capacity
-                       # (the old 4-layer stack was the model's most undersized axis).
-MAX_SEQ_LEN = 512      # Maximum context window in tokens. With 3.8x BPE compression, this covers ~2000 characters.
+# Model shape is env-parameterizable so we can train different sizes from the same code
+# WITHOUT touching this file (e.g. the ~206M coherence config: NLEARN_D_MODEL=1024
+# NLEARN_N_HEADS=16 NLEARN_N_LAYERS=12 NLEARN_D_FF=2816). Defaults reproduce the 123M
+# dense123m model exactly, so any run that doesn't set these is unchanged. A run's shape
+# is fixed by its checkpoint, so always launch a given run_name with the same env.
+D_MODEL     = int(os.environ.get("NLEARN_D_MODEL", "768"))   # token vector width; params ∝ D_MODEL²
+N_HEADS     = int(os.environ.get("NLEARN_N_HEADS", "12"))    # D_MODEL must be divisible by N_HEADS (dh=64)
+D_FF        = int(os.environ.get("NLEARN_D_FF", "2048"))     # SwiGLU hidden; ~(8/3)·D_MODEL is param-matched
+N_LAYERS    = int(os.environ.get("NLEARN_N_LAYERS", "12"))   # transformer blocks; depth is cheap capacity
+MAX_SEQ_LEN = int(os.environ.get("NLEARN_MAX_SEQ_LEN", "512"))  # RoPE → not a hard cap; informational
 
 # Depth-scaled init: residual-output projections (attention W_o, FFN W_down) are
 # scaled by 1/sqrt(2·N_LAYERS) so the residual stream variance stays ~constant with
@@ -74,7 +75,8 @@ def init_embeddings(key):
 
 def embed(params, token_ids):
     """
-    Looks up and adds token + position embeddings for a sequence of token IDs.
+    Looks up TOKEN embeddings for a sequence of token IDs. No position embeddings are added
+    here — position is injected later by RoPE on Q/K inside attention (no learned position table).
 
     token_ids: a 1D integer array of shape (seq_len,), e.g. [72, 101, 108, ...]
     Returns:   a 2D float array of shape (seq_len, D_MODEL)
@@ -113,25 +115,27 @@ def init_attention(key):
 
     scale = 0.02  # Small init scale to keep values stable at the start of training.
 
-    return {
+    p = {
         'W_q': random.normal(key_q, (D_MODEL, D_MODEL)) * scale,
-        # W_q shape: (D_MODEL, D_MODEL) = (128, 128)
-        # Multiplying input x @ W_q projects each token vector into "query space".
-        # Query = "what am I looking for?"
-
-        'W_k': random.normal(key_k, (D_MODEL, D_MODEL)) * scale,
-        # W_k projects input into "key space".
-        # Key = "what do I contain / advertise?"
-
-        'W_v': random.normal(key_v, (D_MODEL, D_MODEL)) * scale,
-        # W_v projects input into "value space".
-        # Value = "what do I actually send if someone attends to me?"
-
+        # x @ W_q projects each token vector into "query space" (what am I looking for?).
+        'W_k': random.normal(key_k, (D_MODEL, D_MODEL)) * scale,   # key space (what do I advertise?)
+        'W_v': random.normal(key_v, (D_MODEL, D_MODEL)) * scale,   # value space (what do I send?)
         'W_o': random.normal(key_o, (D_MODEL, D_MODEL)) * (scale * RESIDUAL_SCALE),
-        # W_o is the output projection applied after all heads are concatenated.
-        # It mixes information across heads and projects back to D_MODEL dims.
-        # Residual-output projection → depth-scaled init (×1/sqrt(2·N_LAYERS)).
+        # W_o mixes heads + projects back to D_MODEL. Residual-output → depth-scaled init (×1/sqrt(2·N_LAYERS)).
     }
+    # Learnable per-head QK logit scale (roadmap 3.1, NLEARN_QK_SCALE=1). With QK-norm, the fixed
+    # 1/sqrt(d_head) is an under-parameterized softmax temperature; a learnable per-head scalar lets
+    # each head tune its attention sharpness. Init = 1/sqrt(d_head) so it is IDENTITY to the old fixed
+    # scale at init (applied by pre-scaling Q; see attention_forward). 1D param -> AdamW, not Muon.
+    # !! WARNING (2026-07-08): correct on CPU/CUDA, but DEGENERATES training on IREE metal-spirv —
+    # adding this trainable attention param tips the fwd+bwd graph into the miscompile regime (loss
+    # pins at ln(V)=10.8249 under value_and_grad; val, which has no grad, stays correct). Both a
+    # reshape-based and a tile-based application reproduce it. Needs a KERNEL-level scale (inject into
+    # flash_attention.metal + its VJP) to work on metal. Keep DEFAULT OFF on this backend.
+    if os.environ.get("NLEARN_QK_SCALE") == "1":
+        d_head = D_MODEL // N_HEADS
+        p['qk_scale'] = jnp.ones(N_HEADS, dtype=jnp.float32) * (1.0 / (d_head ** 0.5))
+    return p
 
 
 def _qk_norm(x, eps=1e-6):
@@ -192,6 +196,15 @@ def attention_forward(params, x):
     Q = apply_rope(Q, positions)
     K = apply_rope(K, positions)
 
+    # Learnable per-head QK logit scale (roadmap 3.1). attention() divides scores by sqrt(d_head)
+    # internally (incl. the flash kernel), so to get logits = qk_scale·(Q·K) we PRE-SCALE Q by
+    # qk_scale·sqrt(d_head) per head — no kernel change. Init qk_scale=1/sqrt(d_head) => Q unchanged.
+    # NB: bh = bs·N_HEADS with head = bh % N_HEADS, so TILE the scale to (bh,) and broadcast-multiply
+    # WITHOUT a reshape (the reshape (bs,heads,..) form miscompiled the grad graph on metal-spirv).
+    if 'qk_scale' in params:
+        _s_bh = jnp.tile(params['qk_scale'] * jnp.sqrt(jnp.asarray(d_head, dtype=Q.dtype)), bs)  # (bh,)
+        Q = Q * _s_bh[:, None, None]
+
     out = attention(Q, K, V)                                # (bs·heads, seq, d_head)
     out = (out.reshape(bs, N_HEADS, seq_len, d_head)
               .transpose(0, 2, 1, 3).reshape(bs, seq_len, D_MODEL))
@@ -243,13 +256,11 @@ def layer_norm(params, x):
 
 def init_ffn(key):
     """
-    The feed-forward network is two linear layers with a GeLU activation in between.
-    It operates on each token independently (no communication between tokens here).
+    SwiGLU feed-forward network (no biases). Operates on each token independently.
 
-    Architecture: D_MODEL → D_FF → D_MODEL
-                    128   →  512  →   128
-    The expansion to D_FF (4× wider) gives the model capacity to compute
-    complex non-linear transformations on each token's representation.
+    out = (silu(x·W_gate) ⊙ (x·W_up)) · W_down,  shape D_MODEL → D_FF → D_MODEL.
+    D_FF ≈ (8/3)·D_MODEL is the param-matched point vs a 4× GeLU MLP. The expansion gives
+    the model capacity for complex non-linear per-token transformations.
     """
     key_g, key_u, key_d = random.split(key, 3)  # gate / up / down
 
@@ -332,23 +343,22 @@ def init_model(key):
     """
     Initializes every parameter in the full decoder-only transformer.
     Returns a single nested dict containing all parameters.
+
+    With NLEARN_SCAN_LAYERS=1 the blocks are STORED STACKED — 'blocks' becomes a dict of arrays
+    with a leading layer axis (e.g. W_q -> [N_LAYERS, D_MODEL, D_MODEL]) instead of a Python list of
+    N_LAYERS dicts. This is what lets DEEP models train on metal-spirv: the forward scans over the
+    stacked blocks (one compiled layer body) and the optimizer update is one vectorized op-tree (9
+    leaves, not 9·N) — both constant-size in depth, dodging the two graph-size ceilings that made the
+    unrolled loop + per-layer optimizer degenerate/hang above ~12 layers. Default (list) is unchanged.
     """
-    # Split into enough keys: 1 for embeddings, N_LAYERS for blocks. (No lm_head key —
-    # the output projection is TIED to the token embedding, see output_projection().)
     keys = random.split(key, N_LAYERS + 1)
-
+    blocks = [init_block(keys[i + 1]) for i in range(N_LAYERS)]
+    if os.environ.get("NLEARN_SCAN_LAYERS") == "1":
+        blocks = jax.tree_util.tree_map(lambda *a: jnp.stack(a), *blocks)   # dict of [N_LAYERS, ...] arrays
     return {
-        'embeddings': init_embeddings(keys[0]),
-        # Token embedding table, shape (VOCAB_SIZE, D_MODEL). Doubles as the output
-        # projection (tied weights) — no separate lm_head, saving VOCAB_SIZE·D_MODEL params
-        # (~25M at D_MODEL=512, the bulk of a small model).
-
-        'blocks': [init_block(keys[i + 1]) for i in range(N_LAYERS)],
-        # A Python list of N_LAYERS block parameter dicts.
-        # Each block is independent with its own weights — they don't share parameters.
-
-        'ln_final': init_layer_norm(),
-        # One last RMSNorm applied after all blocks, before the (tied) output projection.
+        'embeddings': init_embeddings(keys[0]),   # (VOCAB_SIZE, D_MODEL), tied to the output projection
+        'blocks': blocks,                          # list of N dicts, OR (scan) dict of stacked [N,...] arrays
+        'ln_final': init_layer_norm(),             # final RMSNorm before the tied output projection
     }
 
 
@@ -374,13 +384,43 @@ def model_forward_features(params, token_ids):
         params,
     )
     x = embed(bf16_params['embeddings'], token_ids)
-    # NLEARN_NO_CHECKPOINT=1 disables remat (diagnostic: does remat-wrapping the
-    # flash custom_vjp trigger the seq>=256 hang on metal-spirv?).
     import os as _os
-    _block = block_forward if _os.environ.get("NLEARN_NO_CHECKPOINT") == "1" \
-        else jax.checkpoint(block_forward, prevent_cse=False)
-    for block_params in bf16_params['blocks']:
-        x = _block(block_params, x)
+    if _os.environ.get("NLEARN_SCAN_LAYERS") == "1":
+        # DEPTH-CEILING FIX: metal-spirv miscompiles the fwd+bwd graph above ~12 UNROLLED layers
+        # (the Python loop below bakes all N layers into one giant graph). lax.scan compiles the
+        # ONE-layer body once and reuses it, so the compiled program is constant-size regardless of
+        # depth -> deep models (>12L) stop degenerating. 'blocks' is STORED STACKED (init_model), i.e.
+        # a dict of [N_LAYERS, ...] arrays, so scan feeds one layer's params per step directly.
+        # PARTIAL UNROLL (NLEARN_UNROLL_GROUP=G, must divide N_LAYERS): scan over N/G GROUPS, each an
+        # UNROLLED block of G layers. Scanning single layers gives the metal-spirv backend no
+        # cross-layer fusion (measured: 24L-scan MFU ~30% vs ~93% for a fully-unrolled shallow graph);
+        # a G-layer unrolled body is a bigger fuseable chunk (like the shallow case) while N/G stays
+        # under the ~12-layer graph-size ceiling. G=1 is the original one-layer-per-step scan.
+        _grp = int(_os.environ.get("NLEARN_UNROLL_GROUP", "1") or "1")
+        _blocks = bf16_params['blocks']
+        if _grp > 1:
+            _nl = jax.tree_util.tree_leaves(_blocks)[0].shape[0]   # N_LAYERS from stacked leading axis
+            _ng = _nl // _grp
+            _blocks = jax.tree_util.tree_map(
+                lambda a: a.reshape(_ng, _grp, *a.shape[1:]), _blocks)
+            def _body_fn(carry, gp):                                # gp: dict of [G, ...]
+                for _i in range(_grp):
+                    carry = block_forward(jax.tree_util.tree_map(lambda a: a[_i], gp), carry)
+                return carry, None
+        else:
+            _body_fn = _scan_body
+        # Remat on by default (recompute in backward, saving activation memory). Measured on this
+        # backend, remat is also FASTER for the deep scan (no-remat: 13.5s/step vs 4.0s — the un-remat'd
+        # scan backward miscodegens), so it's the default. NLEARN_NO_CHECKPOINT=1 disables it.
+        _body = _body_fn if _os.environ.get("NLEARN_NO_CHECKPOINT") == "1" \
+            else jax.checkpoint(_body_fn, prevent_cse=False)
+        x, _ = jax.lax.scan(_body, x, _blocks)
+    else:
+        # NLEARN_NO_CHECKPOINT=1 disables remat.
+        _block = block_forward if _os.environ.get("NLEARN_NO_CHECKPOINT") == "1" \
+            else jax.checkpoint(block_forward, prevent_cse=False)
+        for block_params in bf16_params['blocks']:
+            x = _block(block_params, x)
     # Cast back to float32 for the final layer norm and loss computation.
     return layer_norm(params['ln_final'], x.astype(jnp.float32))
 
