@@ -51,6 +51,8 @@ struct FwdBindings {
 #define D_TILES 8           // d_head / 8 (model d_head = 64)
 #define NWARPS  2           // TG_SIZE_X / 32
 #define QSUB    (TG_SIZE_X / 8)   // 8 query sub-blocks of 8 per 64-query workgroup
+#define KTILE   64u         // keys processed per streaming iteration (multiple of 8, ≤ seq_len)
+#define KSUB    (KTILE / 8) // number of 8-wide key sub-tiles per KTILE
 
 kernel void flash_attention_fwd(
     constant FwdBindings&   args [[buffer(0)]],
@@ -71,7 +73,7 @@ kernel void flash_attention_fwd(
     device const float* V = args.V + head_off;
     device       float* O = args.O + head_off;
 
-    threadgroup float Smem[NWARPS][8][8];         // S / P tile per simdgroup
+    threadgroup float Smem[NWARPS][8][KTILE];        // S / P tile per simdgroup (8q × KTILE=32k)
     threadgroup float Omem[NWARPS][8][MAX_DHEAD]; // O accumulator (threadgroup so we can
     threadgroup float PVm_s[NWARPS][8][MAX_DHEAD];// per-row rescale) + P·V scratch
 
@@ -88,22 +90,26 @@ kernel void flash_attention_fwd(
             simdgroup_load(Qm[dt], Q + qrow * d + dt * 8, d);
 
         const uint kmax = qrow + 8;               // causal: keys < kmax (8-aligned)
-        for (uint kb = 0; kb < kmax; kb += 8) {
-            // S[8q,8k] = Σ_dt Q[:,dt]·Kᵀ[dt,:]  (load K transposed → [8d,8k])
-            simdgroup_float8x8 Sm = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            for (uint dt = 0; dt < D_TILES; ++dt) {
-                simdgroup_float8x8 KTm;
-                simdgroup_load(KTm, K + kb * d + dt * 8, d, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(Sm, Qm[dt], KTm, Sm);
+        // KTILE=32 keys per iteration (4 simdgroup 8-wide sub-tiles): 4× fewer softmax passes +
+        // barriers than the old 8-wide streaming loop; the matrix-unit matmuls do identical work.
+        for (uint kb = 0; kb < kmax; kb += KTILE) {
+            // S[8q,32k] = Σ_dt Q[:,dt]·Kᵀ[dt,:]  — 4 key sub-tiles into the 8×32 Smem tile
+            for (uint ks = 0; ks < KSUB; ++ks) {
+                simdgroup_float8x8 Sm = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                for (uint dt = 0; dt < D_TILES; ++dt) {
+                    simdgroup_float8x8 KTm;
+                    simdgroup_load(KTm, K + (kb + ks * 8) * d + dt * 8, d, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(Sm, Qm[dt], KTm, Sm);
+                }
+                simdgroup_store(Sm, &Smem[sgid][0][ks * 8], KTILE);
             }
-            simdgroup_store(Sm, &Smem[sgid][0][0], 8);
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
-            // streaming softmax for this key-block (row = lane, lane<8)
+            // streaming softmax over the 32-key tile (row = lane, lane<8)
             if (lane < 8) {
                 const uint qi = qrow + lane;
                 float rmax = -INFINITY;
-                for (uint ki = 0; ki < 8; ++ki) {
+                for (uint ki = 0; ki < KTILE; ++ki) {
                     float s = (kb + ki <= qi) ? Smem[sgid][lane][ki] * scale : -INFINITY;
                     Smem[sgid][lane][ki] = s;
                     rmax = max(rmax, s);
@@ -111,7 +117,7 @@ kernel void flash_attention_fwd(
                 const float m_new = max(m_row, rmax);
                 const float corr  = exp(m_row - m_new);
                 float rsum = 0.0f;
-                for (uint ki = 0; ki < 8; ++ki) {
+                for (uint ki = 0; ki < KTILE; ++ki) {
                     float pv = exp(Smem[sgid][lane][ki] - m_new);  // masked → exp(-inf)=0
                     Smem[sgid][lane][ki] = pv;
                     rsum += pv;
@@ -122,13 +128,15 @@ kernel void flash_attention_fwd(
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
 
-            // O += P[8q,8k] · V[8k,8d]  per d-tile
-            simdgroup_float8x8 Pm;
-            simdgroup_load(Pm, &Smem[sgid][0][0], 8);
+            // O += P[8q,32k] · V[32k,8d]  per d-tile (sum over the 4 key sub-tiles)
             for (uint dt = 0; dt < D_TILES; ++dt) {
-                simdgroup_float8x8 Vm, PV = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                simdgroup_load(Vm, V + kb * d + dt * 8, d);
-                simdgroup_multiply_accumulate(PV, Pm, Vm, PV);
+                simdgroup_float8x8 PV = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                for (uint ks = 0; ks < KSUB; ++ks) {
+                    simdgroup_float8x8 Pm, Vm;
+                    simdgroup_load(Pm, &Smem[sgid][0][ks * 8], KTILE);
+                    simdgroup_load(Vm, V + (kb + ks * 8) * d + dt * 8, d);
+                    simdgroup_multiply_accumulate(PV, Pm, Vm, PV);
+                }
                 simdgroup_store(PV, &PVm_s[sgid][0][dt * 8], d);
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
