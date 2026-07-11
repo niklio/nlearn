@@ -29,9 +29,11 @@ CONFIG_ENV = {
     "NLEARN_MANUAL_ACCUM": "1",        # split grad/apply -> under the graph ceiling
     # d=768 default (proven-trainable, faster than d=1024). grad-clip + hard-val on via .runenv.
 }
-# run steps seq BATCH ACCUM lr : eff batch 32; lr 3e-4 (stable for deep); steps=2e6 -> eff 125k updates
+# run steps seq BATCH ACCUM lr : eff batch 32 (bs4*accum8); lr 3e-4; steps=2e6.
+# bs4 over bs2: MFU saturates at bs4 (~44% vs ~40%; profile_deep_mfu.py batch sweep), bs8 adds nothing.
+# Effective batch unchanged (32) so LR schedule / dynamics / resume are all compatible.
 CMD = ["bash", os.path.join(REPO, "scripts", "supervise.sh"),
-       RUN, "2000000", "1024", "2", "16", "3e-4"]
+       RUN, "2000000", "1024", "4", "8", "3e-4"]
 
 # Record CURRENT_RUN so the run-agnostic watchdog supervises + survives reboots.
 try:
