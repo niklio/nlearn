@@ -32,6 +32,11 @@ JAX_PLATFORMS=iree_metal python -c 'import jax; print(jax.devices())'
 The wheel embeds `build_info.json` with the source revisions and SHA-256 digest of every
 native artifact. Run `iree-metal-doctor` to inspect it without loading JAX.
 
+Developer-preview wheels are assembled and tested on GitHub's hosted Apple Silicon runners
+from a separately built, revision-pinned native bundle. Release tags use the form
+`iree-metal-preview-v<PEP-440-version>`; see `RELEASE.md` for the protected native-builder
+bootstrap and release process.
+
 ## Known limitations
 
 - The Metal backend and compiler patches are not yet upstream.

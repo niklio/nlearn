@@ -20,6 +20,7 @@ DEFAULT_BUILD = (
     Path.home()
     / "src/iree/integrations/pjrt/python_packages/iree_metal_plugin/build/cmake"
 )
+NATIVE_BUNDLE_DIR = os.environ.get("IREE_METAL_NATIVE_BUNDLE_DIR")
 VERSION = os.environ.get("IREE_METAL_PREVIEW_VERSION", "0.1.0.dev0")
 
 
@@ -65,23 +66,42 @@ class BundleBuildPy(build_py):
 
     def run(self):
         super().run()
-        build_root = Path(os.environ.get("IREE_METAL_BUILD_DIR", DEFAULT_BUILD)).expanduser()
-        iree_root = build_root
-        for _ in range(8):
-            if (iree_root / ".git").exists():
-                break
-            iree_root = iree_root.parent
-        artifacts = {
-            "_native/libIREECompiler.dylib": build_root / "iree_core/lib/libIREECompiler.dylib",
-            "_native/pjrt_plugin_iree_metal.dylib": (
-                build_root
-                / "python/iree/_pjrt_libs/metal/pjrt_plugin_iree_metal.dylib"
-            ),
-            "kernels/flash_attention.metal": REPO_ROOT / "iree_metal/kernels/flash_attention.metal",
-            "kernels/gemm.metal": REPO_ROOT / "iree_metal/kernels/gemm.metal",
-            "kernels/cross_entropy.metal": REPO_ROOT / "iree_metal/kernels/cross_entropy.metal",
-            "licenses/IREE_LICENSE.txt": iree_root / "LICENSE",
-        }
+        native_manifest = None
+        if NATIVE_BUNDLE_DIR:
+            native_root = Path(NATIVE_BUNDLE_DIR).expanduser().resolve()
+            manifest_path = native_root / "native_manifest.json"
+            if not manifest_path.is_file():
+                raise RuntimeError(
+                    f"Native bundle manifest is missing: {manifest_path}"
+                )
+            native_manifest = json.loads(manifest_path.read_text())
+            artifacts = {
+                "_native/libIREECompiler.dylib": native_root / "libIREECompiler.dylib",
+                "_native/pjrt_plugin_iree_metal.dylib": native_root / "pjrt_plugin_iree_metal.dylib",
+                "kernels/flash_attention.metal": REPO_ROOT / "iree_metal/kernels/flash_attention.metal",
+                "kernels/gemm.metal": REPO_ROOT / "iree_metal/kernels/gemm.metal",
+                "kernels/cross_entropy.metal": REPO_ROOT / "iree_metal/kernels/cross_entropy.metal",
+                "licenses/IREE_LICENSE.txt": native_root / "IREE_LICENSE.txt",
+            }
+            iree_root = None
+        else:
+            build_root = Path(os.environ.get("IREE_METAL_BUILD_DIR", DEFAULT_BUILD)).expanduser()
+            iree_root = build_root
+            for _ in range(8):
+                if (iree_root / ".git").exists():
+                    break
+                iree_root = iree_root.parent
+            artifacts = {
+                "_native/libIREECompiler.dylib": build_root / "iree_core/lib/libIREECompiler.dylib",
+                "_native/pjrt_plugin_iree_metal.dylib": (
+                    build_root
+                    / "python/iree/_pjrt_libs/metal/pjrt_plugin_iree_metal.dylib"
+                ),
+                "kernels/flash_attention.metal": REPO_ROOT / "iree_metal/kernels/flash_attention.metal",
+                "kernels/gemm.metal": REPO_ROOT / "iree_metal/kernels/gemm.metal",
+                "kernels/cross_entropy.metal": REPO_ROOT / "iree_metal/kernels/cross_entropy.metal",
+                "licenses/IREE_LICENSE.txt": iree_root / "LICENSE",
+            }
         missing = [str(path) for path in artifacts.values() if not path.is_file()]
         if missing:
             raise RuntimeError(
@@ -96,14 +116,25 @@ class BundleBuildPy(build_py):
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
 
+        if native_manifest:
+            iree_revision = native_manifest.get("iree_revision")
+            iree_source_state = {
+                "revision": iree_revision,
+                "dirty": native_manifest.get("source_dirty"),
+                "diff_sha256": native_manifest.get("source_diff_sha256"),
+            }
+        else:
+            iree_revision = _git_revision(iree_root)
+            iree_source_state = _git_state(iree_root)
+
         manifest = {
             "format_version": 1,
             "package_version": VERSION,
             "nlearn_revision": _git_revision(REPO_ROOT),
-            "iree_revision": _git_revision(iree_root),
+            "iree_revision": iree_revision,
             "sources": {
                 "nlearn": _git_state(REPO_ROOT),
-                "iree": _git_state(iree_root),
+                "iree": iree_source_state,
             },
             "artifacts": {
                 relative: {
@@ -113,6 +144,8 @@ class BundleBuildPy(build_py):
                 for relative, source in artifacts.items()
             },
         }
+        if native_manifest:
+            manifest["native_bundle"] = native_manifest
         (package_root / "build_info.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )

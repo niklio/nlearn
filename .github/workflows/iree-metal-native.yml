@@ -1,0 +1,115 @@
+name: IREE Metal native bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      iree_ref:
+        description: Full commit from niklio/iree-metal (blank uses the pinned revision)
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: iree-metal-native-release
+  cancel-in-progress: false
+
+jobs:
+  build-native:
+    if: github.repository == 'niklio/nlearn' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, iree-metal-release]
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out packaging source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve IREE revision
+        id: iree
+        env:
+          REQUESTED_IREE_REF: ${{ inputs.iree_ref }}
+        run: |
+          ref="$REQUESTED_IREE_REF"
+          if [[ -z "$ref" ]]; then
+            ref="$(tr -d '[:space:]' < iree_metal/ci/iree-ref.txt)"
+          fi
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "iree_ref must be a full 40-character commit, got: $ref" >&2
+            exit 2
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned IREE fork
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: niklio/iree-metal
+          ref: ${{ steps.iree.outputs.ref }}
+          path: iree-source
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source revision
+        run: |
+          test "$(git -C iree-source rev-parse HEAD)" = "${{ steps.iree.outputs.ref }}"
+          test -z "$(git -C iree-source status --porcelain --untracked-files=normal)"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: true
+
+      - name: Build compiler and PJRT plugin
+        env:
+          CMAKE_OSX_ARCHITECTURES: arm64
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: |
+          uv venv .native-venv --python 3.13
+          uv pip install --python .native-venv/bin/python \
+            'jax==0.6.1' 'jaxlib==0.6.1' \
+            'iree-base-compiler==3.11.0' 'iree-base-runtime==3.11.0' \
+            cmake ninja setuptools wheel
+          uv pip install --python .native-venv/bin/python \
+            --no-build-isolation --no-deps -v -e \
+            iree-source/integrations/pjrt/python_packages/iree_metal_plugin
+          cmake --build \
+            iree-source/integrations/pjrt/python_packages/iree_metal_plugin/build/cmake \
+            --target libIREECompiler --parallel 4
+
+      - name: Create verified native bundle
+        id: bundle
+        run: |
+          ./scripts/create_iree_metal_native_bundle.sh iree-source native-dist
+          archive="$(find native-dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=${archive}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iree-metal-native-${{ steps.iree.outputs.ref }}-macos-arm64
+          path: |
+            ${{ steps.bundle.outputs.archive }}
+            ${{ steps.bundle.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish immutable native prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IREE_REVISION: ${{ steps.iree.outputs.ref }}
+          ARCHIVE: ${{ steps.bundle.outputs.archive }}
+          CHECKSUM: ${{ steps.bundle.outputs.checksum }}
+        run: |
+          tag="iree-metal-native-${IREE_REVISION:0:12}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Native release already exists and will not be overwritten: $tag" >&2
+            exit 2
+          fi
+          gh release create "$tag" "$ARCHIVE" "$CHECKSUM" \
+            --prerelease \
+            --title "IREE Metal native bundle ${IREE_REVISION:0:12}" \
+            --notes "Apple Silicon compiler and PJRT plugin built from niklio/iree-metal@${IREE_REVISION}. This immutable bundle is an input to wheel CI, not an end-user package."

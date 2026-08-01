@@ -1,0 +1,85 @@
+name: IREE Metal prerelease
+
+on:
+  push:
+    tags:
+      - iree-metal-preview-v*
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: iree-metal-preview-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'niklio/nlearn'
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          enable-cache: true
+
+      - name: Resolve package version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#iree-metal-preview-v}"
+          python -m pip install --disable-pip-version-check packaging
+          python -c 'from packaging.version import Version; Version(__import__("sys").argv[1])' "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download pinned native bundle
+        id: native
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          path="$(./scripts/download_iree_metal_native_bundle.sh "$RUNNER_TEMP/native")"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Build and validate wheel
+        env:
+          IREE_METAL_NATIVE_BUNDLE_DIR: ${{ steps.native.outputs.path }}
+          IREE_METAL_PREVIEW_VERSION: ${{ steps.version.outputs.version }}
+          PYTHON_BIN: python
+        run: |
+          ./scripts/build_iree_metal_wheel.sh
+          python -m pip install --disable-pip-version-check twine
+          python -m twine check iree_metal/wheel/dist/*.whl
+          ./scripts/test_iree_metal_wheel.sh iree_metal/wheel/dist/*.whl
+          shasum -a 256 iree_metal/wheel/dist/*.whl > iree_metal/wheel/dist/SHA256SUMS
+
+      - name: Attest wheel provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: iree_metal/wheel/dist/*.whl
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            iree_metal/wheel/dist/*.whl \
+            iree_metal/wheel/dist/SHA256SUMS \
+            --verify-tag \
+            --prerelease \
+            --generate-notes \
+            --title "IREE Metal preview ${{ steps.version.outputs.version }}"

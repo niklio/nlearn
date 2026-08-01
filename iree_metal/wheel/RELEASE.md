@@ -15,6 +15,33 @@ The build fails if either dylib, a kernel, or the upstream IREE license is missi
 a macOS-arm64 platform wheel and embeds hashes plus clean/dirty source-tree state in
 `build_info.json`.
 
+## Automated pipeline
+
+The release path deliberately separates the large native build from ordinary wheel CI:
+
+1. Register a dedicated Apple Silicon runner with the labels `self-hosted`, `macOS`,
+   `ARM64`, and `iree-metal-release`. Only the protected `main` branch is allowed to run
+   `.github/workflows/iree-metal-native.yml`; never expose this runner to fork pull requests.
+2. Run **IREE Metal native bundle** manually with the desired full commit from
+   `niklio/iree-metal`. It performs a clean native build and creates an immutable prerelease
+   named `iree-metal-native-<12-character revision>`.
+3. Update `iree_metal/ci/iree-ref.txt` to that full revision. Pull requests then download
+   the exact native bundle on GitHub's hosted Apple Silicon runner, build the wheel, run
+   `twine check`, and execute the full disposable-environment smoke test.
+4. Push a protected tag such as `iree-metal-preview-v0.1.0.dev1`. The hosted release job
+   rebuilds the wheel from the pinned bundle, repeats all tests, produces `SHA256SUMS`,
+   generates a GitHub artifact attestation, and publishes a prerelease.
+
+The native release is a build input, not an end-user download. Updating the pin is the only
+packaging change required when the parity campaign selects a newer IREE revision.
+
+For local assembly from a downloaded bundle:
+
+```bash
+native_dir="$(./scripts/download_iree_metal_native_bundle.sh)"
+IREE_METAL_NATIVE_BUNDLE_DIR="$native_dir" ./scripts/build_iree_metal_wheel.sh
+```
+
 ## Required gates
 
 1. Both source trees are clean, or the dirty diff hashes are deliberately documented.
