@@ -12,7 +12,7 @@ on:
       - scripts/smoke_iree_metal_kernels.py
       - scripts/test_iree_metal_wheel.sh
   push:
-    branches: [main]
+    branches: [main, codex/iree-metal-preview]
     paths:
       - .github/workflows/iree-metal-*.yml
       - iree_metal/ci/**
