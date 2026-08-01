@@ -10,6 +10,13 @@ if [ ! -f "$CLUSTER_CONF" ]; then
 fi
 source "$CLUSTER_CONF"
 
+# Optional machine-local HF config. HF_TOKEN_FILE lets multiple projects reuse one
+# chmod-600 token without copying the secret into each repository.
+[ -f "$HOME/.config/nlearn/hf.env" ] && source "$HOME/.config/nlearn/hf.env"
+if [ -z "${HF_TOKEN:-}" ] && [ -n "${HF_TOKEN_FILE:-}" ]; then
+  HF_TOKEN=$(tr -d '\r\n' < "$HF_TOKEN_FILE")
+fi
+
 # Leaderboard posting: pull in LEADERBOARD_URL/LEADERBOARD_TOKEN so they can be
 # forwarded to remote jobs below, regardless of how this script was invoked
 # (these are written by the deploy at ~/.config/nlearn/leaderboard.env).
@@ -85,10 +92,11 @@ usage() {
   echo "      --prompt <text>             Input text to continue from  (required)"
   echo "      --n-tokens <n>              Number of new tokens to generate  (required)"
   echo "      --local-checkpoint <path>   Local .pkl checkpoint file"
-  echo "      --run-id <id>               W&B run ID to download checkpoint from"
+  echo "      --hf-run <name>             Run name in the HF checkpoint bucket"
+  echo "      --checkpoint <value>        latest, resume, or step number (default: latest)"
+  echo "      --hf-bucket <owner/name>    HF Storage Bucket (or config value)"
   echo "      --temperature <f>           Sampling temperature (default: 0.8)"
-  echo "      --project <str>             W&B project name (default: nlearn-transformer)"
-  echo "      Example: ./cluster.sh generate --local-checkpoint checkpoints/step_005000.pkl --prompt 'Hello' --n-tokens 100"
+  echo "      Example: ./cluster.sh generate --hf-run deep_hero --prompt 'Hello' --n-tokens 100"
   echo ""
   echo "CONFIGURATION"
   echo "  Cluster connection is read from .cluster.conf (copy from .cluster.conf.example):"
@@ -166,6 +174,14 @@ case "${1:-}" in
     do_setup
     ;;
 
+  generate)
+    shift
+    ARGS=$(printf '%q ' "$@")
+    ensure_ready
+    ssh -t "$SSH" \
+      "export PATH=/opt/homebrew/bin:\$PATH; ${HF_TOKEN:+export HF_TOKEN=${HF_TOKEN};} ${NLEARN_HF_BUCKET:+export NLEARN_HF_BUCKET=${NLEARN_HF_BUCKET};} cd ${CLUSTER_DIR} && python3 -u -m nlearn.generate ${ARGS}"
+    ;;
+
   ""|help|--help)
     usage
     ;;
@@ -191,8 +207,9 @@ case "${1:-}" in
     # Write the job as a script file piped through stdin — avoids all quoting issues
     # across the local shell → SSH → remote shell → pueue chain.
     JOB_SCRIPT="/tmp/cluster_job_$(date +%s).sh"
-    printf '#!/bin/bash\nexport PATH=/opt/homebrew/bin:$PATH\n%s\n%s\n%s\ncd %s\n%s\n' \
+    printf '#!/bin/bash\nexport PATH=/opt/homebrew/bin:$PATH\n%s\n%s\n%s\n%s\ncd %s\n%s\n' \
       "${HF_TOKEN:+export HF_TOKEN=${HF_TOKEN}}" \
+      "${NLEARN_HF_BUCKET:+export NLEARN_HF_BUCKET=${NLEARN_HF_BUCKET}}" \
       "${LEADERBOARD_URL:+export LEADERBOARD_URL=${LEADERBOARD_URL}}" \
       "${LEADERBOARD_TOKEN:+export LEADERBOARD_TOKEN=${LEADERBOARD_TOKEN}}" \
       "${CLUSTER_DIR}" "${CMD}" \

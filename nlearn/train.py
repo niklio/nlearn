@@ -1,4 +1,5 @@
 import sys
+import glob
 import signal
 import threading
 import queue as queue_mod
@@ -20,6 +21,11 @@ from nlearn.attention import print_attention_config
 from nlearn.logging_utils import StepTimer, TrainingLogger, benchmark_peak_tflops
 from nlearn.kernels.cross_entropy import cross_entropy as _fused_ce
 from nlearn.kernels.cross_entropy import linear_cross_entropy as _fused_linear_ce
+from nlearn.checkpoint_store import (
+    download_resume_checkpoint,
+    upload_resume_checkpoint,
+    upload_step_checkpoint,
+)
 
 # NLEARN_FUSED_LMHEAD=1 fuses lm_head + CE (chunked over vocab) so the (bs·seq, vocab)
 # logits are NEVER materialised — the long-context memory enabler (peak ~472MB vs ~1.6GB
@@ -41,21 +47,40 @@ _FUSED_LMHEAD = os.environ.get("NLEARN_FUSED_LMHEAD") == "1"
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_DIR = "checkpoints"
+_warned_local_only = False
 
 def save_checkpoint(params, step, run_name=None):
-    """Save model parameters to disk at a given training step."""
+    """Save parameters locally, then durably publish them to HF if configured."""
+    global _warned_local_only
     subdir = os.path.join(CHECKPOINT_DIR, run_name) if run_name else CHECKPOINT_DIR
     os.makedirs(subdir, exist_ok=True)
 
     path = os.path.join(subdir, f"step_{step:06d}.pkl")
     # Zero-pad the step number so filenames sort correctly (step_000500.pkl, etc.)
 
-    with open(path, 'wb') as f:
+    tmp = path + ".tmp"
+    with open(tmp, 'wb') as f:
         pickle.dump(jax.device_get(params), f)
+    os.replace(tmp, path)
     # jax.device_get() moves all JAX arrays from GPU memory to CPU numpy arrays.
     # This is necessary before pickling — you can't serialize GPU memory directly.
 
     print(f"  Checkpoint saved: {path}")
+    keep = max(1, int(os.environ.get("NLEARN_KEEP_CKPTS", "3")))
+    checkpoints = sorted(glob.glob(os.path.join(subdir, "step_*.pkl")))
+    retained = checkpoints[-keep:]
+    removed = checkpoints[:-keep]
+    uploaded = upload_step_checkpoint(path, step, run_name, retained, removed)
+    if not uploaded and not _warned_local_only:
+        print("  HF checkpointing is disabled: set NLEARN_HF_BUCKET=owner/bucket "
+              "(or pass --hf-bucket) to make checkpoints durable.", flush=True)
+        _warned_local_only = True
+    # Never prune the local recovery copy until the remote file and latest manifest exist.
+    for old in removed:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
     return path
 
 
@@ -87,13 +112,16 @@ def save_resume_state(params, opt_state, step, run_name=None):
     with open(tmp, "wb") as f:
         pickle.dump(state, f)
     os.replace(tmp, path)
+    upload_resume_checkpoint(path, step, run_name)
 
 
 def load_resume_state(run_name=None):
     """Return (params, opt_state, next_step) if a resume file exists, else None."""
     path = _resume_path(run_name)
     if not os.path.exists(path):
-        return None
+        restored = download_resume_checkpoint(path, run_name)
+        if restored is None:
+            return None
     with open(path, "rb") as f:
         state = pickle.load(f)
     return state["params"], state["opt_state"], state["step"]
@@ -613,11 +641,6 @@ def train(steps=N_STEPS, seq_len=512, seed=0, batch_size=BATCH_SIZE, peak_lr=PEA
     logger.print_summary(loss)
     logger.finalize(loss, steps - 1, steps)
 
-    artifact = wandb.Artifact(name="model-checkpoint", type="model")
-    artifact.add_file(final_path)
-    wandb.log_artifact(artifact)
-    print("Checkpoint uploaded to W&B artifacts.")
-
     wandb.finish()
     return params, final_path
 
@@ -634,6 +657,11 @@ if __name__ == "__main__":
     p.add_argument("--dataset",    type=str,   default="fineweb-edu",
                    choices=list(DATASETS.keys()))
     p.add_argument("--resume", action="store_true",
-                   help="resume from this run's checkpoints/<run>/resume.pkl if present")
+                   help="resume from local cache or this run's HF resume.pkl if present")
+    p.add_argument("--hf-bucket", type=str, default=None, metavar="OWNER/BUCKET",
+                   help="HF Storage Bucket for durable checkpoints (or NLEARN_HF_BUCKET)")
     args = p.parse_args()
+    if args.hf_bucket:
+        os.environ["NLEARN_HF_BUCKET"] = args.hf_bucket
+    delattr(args, "hf_bucket")
     train(**vars(args))

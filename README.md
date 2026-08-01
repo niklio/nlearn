@@ -14,6 +14,35 @@ map and the rules for where new files go. The core library is the `nlearn/` pack
 (`python -m nlearn.train`); ops scripts in `scripts/`, benchmarks in `bench/`,
 utilities in `tools/`.
 
+## Durable checkpoints
+
+Training can publish its rolling checkpoint set to a Hugging Face Storage Bucket. Set
+`NLEARN_HF_BUCKET=owner/nlearn-checkpoints` and authenticate with `HF_TOKEN` (or `hf auth
+login`). Parameter checkpoints, the full `resume.pkl`, and a small `manifest.json` are
+stored under `runs/<run-name>/`. W&B remains the metrics dashboard; it no longer receives
+multi-gigabyte model artifacts.
+
+```bash
+# Train, keeping the newest three checkpoints locally and remotely.
+python -m nlearn.train --run-name deep_hero --hf-bucket owner/nlearn-checkpoints
+
+# Resume even on a machine whose local checkpoints/ cache is empty.
+python -m nlearn.train --run-name deep_hero --resume --hf-bucket owner/nlearn-checkpoints
+
+# Generate from the newest checkpoint or a numbered checkpoint.
+python -m nlearn.generate --hf-run deep_hero --checkpoint latest --prompt "Hello" --n-tokens 100
+python -m nlearn.generate --hf-run deep_hero --checkpoint 16500 --prompt "Hello" --n-tokens 100
+```
+
+For cluster runs, put both `HF_TOKEN` and `NLEARN_HF_BUCKET` in `.cluster.conf`; `cluster.py
+train` and `cluster.py generate` forward them to the worker automatically. Upload failures
+stop training before local pruning, so a network/authentication problem cannot silently
+discard the newest checkpoint.
+
+The same values may instead live in the machine-local `~/.config/nlearn/hf.env`. Use
+`HF_TOKEN_FILE=/path/to/chmod-600-token` there to reuse an existing credential without
+copying its secret value.
+
 ---
 
 # Competitive-performance roadmap (current objective)

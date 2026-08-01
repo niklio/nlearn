@@ -14,6 +14,8 @@ import sys
 import time
 from pathlib import Path
 
+from nlearn.checkpoint_store import local_hf_config
+
 REPO_ROOT   = Path(__file__).parent
 CONF_FILE   = REPO_ROOT / ".cluster.conf"
 SENTINEL    = REPO_ROOT / ".cluster_ready"
@@ -36,6 +38,17 @@ def load_conf():
             if "=" in line:
                 k, _, v = line.partition("=")
                 conf[k.strip()] = v.split("#")[0].strip()
+    # Machine-local defaults keep secrets out of the repo and avoid duplicating a
+    # token already managed elsewhere on this box.
+    hf_conf = local_hf_config()
+    if hf_conf.get("NLEARN_HF_BUCKET"):
+        conf.setdefault("NLEARN_HF_BUCKET", hf_conf["NLEARN_HF_BUCKET"])
+    if not conf.get("HF_TOKEN"):
+        if hf_conf.get("HF_TOKEN"):
+            conf["HF_TOKEN"] = hf_conf["HF_TOKEN"]
+        elif hf_conf.get("HF_TOKEN_FILE"):
+            token_path = Path(hf_conf["HF_TOKEN_FILE"]).expanduser()
+            conf["HF_TOKEN"] = token_path.read_text().strip()
     for key in ("CLUSTER_HOST", "CLUSTER_USER", "CLUSTER_DIR"):
         if not conf.get(key):
             die(f"Error: {key} not set in .cluster.conf")
@@ -262,6 +275,10 @@ def submit_job(conf, cmd, label=""):
     """Write a job script to the cluster and submit via pueue. Returns job ID string."""
     job_script = f"/tmp/cluster_job_{int(time.time())}.sh"
     hf_line    = f"export HF_TOKEN={conf['HF_TOKEN']}" if conf.get("HF_TOKEN") else ""
+    hf_bucket_line = (
+        f"export NLEARN_HF_BUCKET={shlex.quote(conf['NLEARN_HF_BUCKET'])}"
+        if conf.get("NLEARN_HF_BUCKET") else ""
+    )
     # Only export a validly-formatted W&B key (40+ chars); otherwise leave the
     # cluster's own `wandb login` in place rather than overriding it with a
     # placeholder (which would fail auth).
@@ -286,6 +303,7 @@ def submit_job(conf, cmd, label=""):
         f"#!/bin/bash\n"
         f"export PATH=/opt/homebrew/bin:$PATH\n"
         f"{hf_line}\n"
+        f"{hf_bucket_line}\n"
         f"{wandb_line}\n"
         f"{lb_lines}\n"
         f"{nlearn_lines}\n"
@@ -397,15 +415,20 @@ def format_jobs(tasks):
 # ---------------------------------------------------------------------------
 
 def cmd_generate(args, conf):
-    """Run generate.py synchronously — output streams live to your terminal."""
+    """Run HF-backed inference synchronously; output streams live."""
     ensure_ready(conf)
     # shlex.quote each arg so multi-word prompts survive the SSH round-trip
     args_str = " ".join(shlex.quote(a) for a in args)
     hf_env   = f"export HF_TOKEN={conf['HF_TOKEN']}; " if conf.get("HF_TOKEN") else ""
+    hf_bucket = conf.get("NLEARN_HF_BUCKET") or os.environ.get("NLEARN_HF_BUCKET")
+    hf_bucket_env = (
+        f"export NLEARN_HF_BUCKET={shlex.quote(hf_bucket)}; " if hf_bucket else ""
+    )
     preamble = iree_env_preamble(conf).replace("\n", "; ")
     full_cmd  = (
         f"export PATH=/opt/homebrew/bin:$PATH; "
         f"{hf_env}"
+        f"{hf_bucket_env}"
         f"{preamble}; "
         f"cd {conf['CLUSTER_DIR']} && {VENV_PY} -u -m nlearn.generate {args_str}"
     )
@@ -544,11 +567,14 @@ TRAIN OPTIONS
   --peak-lr <f>           Peak learning rate (default: 1e-3)
   --dataset <name>        fineweb-edu | c4 | openwebtext
   --run-name <str>        W&B run name
+  --hf-bucket <id>        HF Storage Bucket (or NLEARN_HF_BUCKET in config)
 
 GENERATE OPTIONS
   --prompt <text>         Input text to continue from  (required)
   --n-tokens <n>          Number of new tokens to generate  (required)
-  --run-id <id>           W&B run ID to download checkpoint from
+  --hf-run <name>         Run name in the HF checkpoint bucket
+  --checkpoint <value>    latest, resume, or step number (default: latest)
+  --hf-bucket <id>        HF Storage Bucket (or NLEARN_HF_BUCKET in config)
   --local-checkpoint <p>  Path to a local .pkl checkpoint file
   --temperature <f>       Sampling temperature (default: 0.8)
 """)

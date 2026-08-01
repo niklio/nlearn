@@ -17,3 +17,4 @@ tiktoken
 numpy
 wandb
 datasets
+huggingface_hub>=1.8,<2
