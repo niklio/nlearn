@@ -9,6 +9,9 @@ logs/
 .cluster.conf
 .cluster_ready
 tokenizer.json
+iree_metal/wheel/build/
+iree_metal/wheel/dist/
+iree_metal/wheel/src/*.egg-info/
 
 # leaderboard
 .leaderboard_bench.log
